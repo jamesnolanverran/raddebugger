@@ -253,6 +253,7 @@ struct DI_Shared
   
   // rjf: settings
   B32 auto_downloads;
+  String8 source_map_path;
   
   // rjf: key -> path cache
   U64 key2path_slots_count;

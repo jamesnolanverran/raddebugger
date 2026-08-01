@@ -60,6 +60,19 @@ di_init(CmdLine *cmdline)
   di_shared->slots_count = 4096;
   di_shared->slots = push_array(arena, DI_Slot, di_shared->slots_count);
   di_shared->stripes = stripe_array_alloc(arena);
+  {
+    String8 source_map_path = cmd_line_string(cmdline, str8_lit("source-map"));
+    if(source_map_path.size == 0)
+    {
+      source_map_path = cmd_line_string(cmdline, str8_lit("source-provenance"));
+    }
+    if(source_map_path.size != 0)
+    {
+      Temp scratch = scratch_begin(&arena, 1);
+      di_shared->source_map_path = str8_copy(arena, path_normalized_from_string(scratch.arena, full_path_from_path(scratch.arena, source_map_path)));
+      scratch_end(scratch);
+    }
+  }
   for EachElement(idx, di_shared->req_batches)
   {
     di_shared->req_batches[idx].mutex = mutex_alloc();
@@ -749,6 +762,10 @@ di_async_tick(void)
           else
           {
             rdi_path = str8f(scratch.arena, "%S.rdi", str8_chop_last_dot(og_path));
+            if(di_shared->source_map_path.size != 0)
+            {
+              rdi_path = str8f(scratch.arena, "%S.source_map.rdi", str8_chop_last_dot(og_path));
+            }
           }
         }
         
@@ -794,7 +811,13 @@ di_async_tick(void)
           t->rdi_analyzed = 1;
           File file = file_open(AccessFlag_ShareRead|AccessFlag_Read, rdi_path);
           FileProperties props = properties_from_file(file);
-          if(props.modified < og_min_timestamp)
+          U64 source_map_timestamp = 0;
+          if(!og_is_rdi && di_shared->source_map_path.size != 0)
+          {
+            source_map_timestamp = properties_from_file_path(di_shared->source_map_path).modified;
+          }
+          U64 min_rdi_timestamp = Max(og_min_timestamp, source_map_timestamp);
+          if(props.modified < min_rdi_timestamp)
           {
             t->rdi_is_stale = 1;
           }
@@ -882,6 +905,10 @@ di_async_tick(void)
           // str8_list_pushf(scratch.arena, &params.cmd_line, "--capture");
           str8_list_pushf(scratch.arena, &params.cmd_line, "--rdi");
           str8_list_pushf(scratch.arena, &params.cmd_line, "--out:%S", rdi_path);
+          if(di_shared->source_map_path.size != 0)
+          {
+            str8_list_pushf(scratch.arena, &params.cmd_line, "--source-map:%S", di_shared->source_map_path);
+          }
           str8_list_pushf(scratch.arena, &params.cmd_line, "--thread_count:%I64u", t->thread_count);
           str8_list_pushf(scratch.arena, &params.cmd_line, "--signal_pid:%I64u", (U64)get_process_info()->pid);
           str8_list_pushf(scratch.arena, &params.cmd_line, "--signal_code:%I64u", (U64)t);
