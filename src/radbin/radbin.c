@@ -7,6 +7,343 @@
 #include "radbin/generated/radbin.meta.c"
 
 ////////////////////////////////
+//~ Source Map Helpers
+
+typedef struct RB_SourceMapEntry RB_SourceMapEntry;
+struct RB_SourceMapEntry
+{
+  RB_SourceMapEntry *next;
+  String8 generated_path;
+  U32 generated_line_first;
+  U32 generated_line_last;
+  String8 original_path;
+  U32 original_line_first;
+  U32 original_line_last;
+};
+
+typedef struct RB_SourceMap RB_SourceMap;
+struct RB_SourceMap
+{
+  RB_SourceMapEntry *first;
+  RB_SourceMapEntry *last;
+  U64 count;
+};
+
+internal B32
+rb_source_map_token_from_line(String8 *line, String8 *token_out)
+{
+  String8 l = str8_skip_chop_whitespace(*line);
+  B32 result = 0;
+  if(l.size != 0)
+  {
+    U64 token_opl = 0;
+    for(; token_opl < l.size && !char_is_space(l.str[token_opl]); token_opl += 1);
+    *token_out = str8_prefix(l, token_opl);
+    *line = str8_skip(l, token_opl);
+    result = 1;
+  }
+  return result;
+}
+
+internal B32
+rb_source_map_parse_line(String8 line, String8 *generated_path_out, U64 *generated_first_out, U64 *generated_last_out, String8 *original_path_out, U64 *original_first_out, U64 *original_last_out)
+{
+  B32 result = 0;
+  String8 tokens[6] = {0};
+  U64 token_count = 0;
+  for(; token_count < ArrayCount(tokens) && rb_source_map_token_from_line(&line, &tokens[token_count]); token_count += 1);
+  if(token_count == 6)
+  {
+    U64 generated_first = 0;
+    U64 generated_last = 0;
+    U64 original_first = 0;
+    U64 original_last = 0;
+    if(try_u64_from_str8_c_rules(tokens[1], &generated_first) &&
+       try_u64_from_str8_c_rules(tokens[2], &generated_last) &&
+       try_u64_from_str8_c_rules(tokens[4], &original_first) &&
+       try_u64_from_str8_c_rules(tokens[5], &original_last) &&
+       generated_first <= generated_last &&
+       original_first <= original_last &&
+       generated_first <= max_U32 &&
+       generated_last <= max_U32 &&
+       original_first <= max_U32 &&
+       original_last <= max_U32)
+    {
+      *generated_path_out = tokens[0];
+      *generated_first_out = generated_first;
+      *generated_last_out = generated_last;
+      *original_path_out = tokens[3];
+      *original_first_out = original_first;
+      *original_last_out = original_last;
+      result = 1;
+    }
+  }
+  return result;
+}
+
+internal String8
+rb_source_map_resolved_path(Arena *arena, String8 map_dir, String8 path)
+{
+  String8 result = path_absolute_dst_from_relative_dst_src(arena, path, map_dir);
+  result = path_normalized_from_string(arena, result);
+  return result;
+}
+
+internal RB_SourceMap
+rb_source_map_from_path(Arena *arena, String8 path)
+{
+  RB_SourceMap result = {0};
+  String8 full_path = full_path_from_path(arena, path);
+  String8 map_dir = str8_chop_last_slash(full_path);
+  String8 data = data_from_file_path(arena, full_path);
+  if(data.size == 0)
+  {
+    log_user_errorf("Could not read source map file `%S`.", path);
+  }
+  else
+  {
+    U64 line_num = 0;
+    for(String8 remaining = data; remaining.size != 0;)
+    {
+      String8 raw_line = str8_chop_line(&remaining);
+      String8 line = str8_skip_chop_whitespace(raw_line);
+      line_num += 1;
+      if(line.size == 0 || str8_match(str8_prefix(line, 1), str8_lit("#"), 0))
+      {
+        continue;
+      }
+      if(str8_match(str8_prefix(line, str8_lit("source-map").size), str8_lit("source-map"), StringMatchFlag_CaseInsensitive) ||
+         str8_match(str8_prefix(line, str8_lit("source-provenance").size), str8_lit("source-provenance"), StringMatchFlag_CaseInsensitive))
+      {
+        continue;
+      }
+      
+      String8 generated_path = {0};
+      String8 original_path = {0};
+      U64 generated_first = 0;
+      U64 generated_last = 0;
+      U64 original_first = 0;
+      U64 original_last = 0;
+      if(rb_source_map_parse_line(line, &generated_path, &generated_first, &generated_last, &original_path, &original_first, &original_last))
+      {
+        RB_SourceMapEntry *entry = push_array(arena, RB_SourceMapEntry, 1);
+        entry->generated_path = rb_source_map_resolved_path(arena, map_dir, generated_path);
+        entry->generated_line_first = (U32)generated_first;
+        entry->generated_line_last = (U32)generated_last;
+        entry->original_path = rb_source_map_resolved_path(arena, map_dir, original_path);
+        entry->original_line_first = (U32)original_first;
+        entry->original_line_last = (U32)original_last;
+        SLLQueuePush(result.first, result.last, entry);
+        result.count += 1;
+      }
+      else
+      {
+        log_user_errorf("Could not parse source map `%S` line %I64u. Expected: generated_path generated_first generated_last original_path original_first original_last.", full_path, line_num);
+      }
+    }
+  }
+  return result;
+}
+
+internal RB_SourceMapEntry *
+rb_source_map_entry_from_generated(RB_SourceMap *map, String8 generated_path, U32 line_num)
+{
+  RB_SourceMapEntry *result = 0;
+  String8 normalized_generated_path = generated_path;
+  for(RB_SourceMapEntry *entry = map->first; entry != 0; entry = entry->next)
+  {
+    if(entry->generated_line_first <= line_num &&
+       line_num <= entry->generated_line_last &&
+       str8_match(entry->generated_path, normalized_generated_path, StringMatchFlag_CaseInsensitive|StringMatchFlag_SlashInsensitive))
+    {
+      result = entry;
+      break;
+    }
+  }
+  return result;
+}
+
+internal U32
+rb_source_map_original_line_from_entry(RB_SourceMapEntry *entry, U32 generated_line)
+{
+  U32 result = entry->original_line_first;
+  if(entry->original_line_first != entry->original_line_last)
+  {
+    U32 generated_delta = generated_line - entry->generated_line_first;
+    result = ClampTop(entry->original_line_first + generated_delta, entry->original_line_last);
+  }
+  return result;
+}
+
+internal void
+rb_source_map_equip_src_file_checksum(Arena *arena, RDIM_SrcFile *src_file)
+{
+  if(src_file->checksum_kind == RDI_ChecksumKind_NULL || src_file->checksum.size == 0)
+  {
+    FileProperties props = properties_from_file_path(src_file->path);
+    if(props.modified != 0)
+    {
+      DenseTime *timestamp = push_array(arena, DenseTime, 1);
+      *timestamp = props.modified;
+      src_file->checksum_kind = RDI_ChecksumKind_Timestamp;
+      src_file->checksum = str8((U8 *)timestamp, sizeof(*timestamp));
+    }
+  }
+}
+
+internal RDIM_SrcFile *
+rb_source_map_src_file_from_path(Arena *arena, RDIM_BakeParams *params, String8 path)
+{
+  RDIM_SrcFile *result = 0;
+  for(RDIM_SrcFileChunkNode *chunk = params->src_files.first; chunk != 0 && result == 0; chunk = chunk->next)
+  {
+    for(U64 idx = 0; idx < chunk->count; idx += 1)
+    {
+      RDIM_SrcFile *src_file = &chunk->v[idx];
+      if(str8_match(src_file->path, path, StringMatchFlag_CaseInsensitive|StringMatchFlag_SlashInsensitive))
+      {
+        result = src_file;
+        break;
+      }
+    }
+  }
+  if(result == 0)
+  {
+    result = rdim_src_file_chunk_list_push(arena, &params->src_files, 256);
+    result->path = str8_copy(arena, path);
+  }
+  rb_source_map_equip_src_file_checksum(arena, result);
+  return result;
+}
+
+internal void
+rb_source_map_rebuild_src_file_line_maps(Arena *arena, RDIM_BakeParams *params)
+{
+  params->src_files.source_line_map_count = 0;
+  params->src_files.total_line_count = 0;
+  for(RDIM_SrcFileChunkNode *src_chunk = params->src_files.first; src_chunk != 0; src_chunk = src_chunk->next)
+  {
+    for(U64 idx = 0; idx < src_chunk->count; idx += 1)
+    {
+      RDIM_SrcFile *src_file = &src_chunk->v[idx];
+      src_file->first_line_map_fragment = 0;
+      src_file->last_line_map_fragment = 0;
+      src_file->total_line_count = 0;
+    }
+  }
+  for(RDIM_LineTableChunkNode *lt_chunk = params->line_tables.first; lt_chunk != 0; lt_chunk = lt_chunk->next)
+  {
+    for(U64 table_idx = 0; table_idx < lt_chunk->count; table_idx += 1)
+    {
+      RDIM_LineTable *line_table = &lt_chunk->v[table_idx];
+      for(RDIM_LineSequenceNode *seq_n = line_table->first_seq; seq_n != 0; seq_n = seq_n->next)
+      {
+        rdim_src_file_push_line_sequence(arena, &params->src_files, seq_n->v.src_file, &seq_n->v);
+      }
+    }
+  }
+}
+
+internal void
+rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_SourceMap *map)
+{
+  if(map->count == 0)
+  {
+    return;
+  }
+  
+  params->subset_flags |= RDIM_SubsetFlag_NormalSourcePathNameMap;
+  
+  U64 remapped_line_count = 0;
+  params->line_tables.total_seq_count = 0;
+  params->line_tables.total_line_count = 0;
+  params->line_tables.total_col_count = 0;
+  for(RDIM_LineTableChunkNode *lt_chunk = params->line_tables.first; lt_chunk != 0; lt_chunk = lt_chunk->next)
+  {
+    for(U64 table_idx = 0; table_idx < lt_chunk->count; table_idx += 1)
+    {
+      RDIM_LineTable *line_table = &lt_chunk->v[table_idx];
+      RDIM_LineSequenceNode *old_first_seq = line_table->first_seq;
+      line_table->first_seq = 0;
+      line_table->last_seq = 0;
+      line_table->seq_count = 0;
+      line_table->line_count = 0;
+      line_table->col_count = 0;
+      
+      for(RDIM_LineSequenceNode *old_seq_n = old_first_seq; old_seq_n != 0; old_seq_n = old_seq_n->next)
+      {
+        RDIM_LineSequence *old_seq = &old_seq_n->v;
+        for(U64 run_first = 0; run_first < old_seq->line_count;)
+        {
+          U32 first_line_num = old_seq->line_nums[run_first];
+          RB_SourceMapEntry *first_entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, first_line_num);
+          RDIM_SrcFile *run_src_file = old_seq->src_file;
+          if(first_entry != 0)
+          {
+            run_src_file = rb_source_map_src_file_from_path(arena, params, first_entry->original_path);
+          }
+          
+          U64 run_opl = run_first + 1;
+          for(; run_opl < old_seq->line_count; run_opl += 1)
+          {
+            U32 line_num = old_seq->line_nums[run_opl];
+            RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num);
+            RDIM_SrcFile *src_file = old_seq->src_file;
+            if(entry != 0)
+            {
+              src_file = rb_source_map_src_file_from_path(arena, params, entry->original_path);
+            }
+            if(src_file != run_src_file)
+            {
+              break;
+            }
+          }
+          
+          U64 run_line_count = run_opl - run_first;
+          U64 *voffs = push_array_no_zero(arena, U64, run_line_count + 1);
+          U32 *line_nums = push_array_no_zero(arena, U32, run_line_count);
+          U16 *col_nums = 0;
+          if(old_seq->col_nums != 0)
+          {
+            col_nums = push_array_no_zero(arena, U16, run_line_count*2);
+          }
+          
+          for(U64 idx = 0; idx <= run_line_count; idx += 1)
+          {
+            voffs[idx] = old_seq->voffs[run_first + idx];
+          }
+          for(U64 idx = 0; idx < run_line_count; idx += 1)
+          {
+            U64 old_idx = run_first + idx;
+            U32 line_num = old_seq->line_nums[old_idx];
+            RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num);
+            if(entry != 0)
+            {
+              line_nums[idx] = rb_source_map_original_line_from_entry(entry, line_num);
+              remapped_line_count += 1;
+            }
+            else
+            {
+              line_nums[idx] = line_num;
+            }
+            if(col_nums != 0)
+            {
+              col_nums[idx*2 + 0] = old_seq->col_nums[old_idx*2 + 0];
+              col_nums[idx*2 + 1] = old_seq->col_nums[old_idx*2 + 1];
+            }
+          }
+          
+          rdim_line_table_push_sequence(arena, &params->line_tables, line_table, run_src_file, voffs, line_nums, col_nums, run_line_count);
+          run_first = run_opl;
+        }
+      }
+    }
+  }
+  rb_source_map_rebuild_src_file_line_maps(arena, params);
+  log_infof("Applied source map: %I64u mapping ranges, %I64u line records remapped.\n", map->count, remapped_line_count);
+}
+
+////////////////////////////////
 //~ rjf: Top-Level Entry Points
 
 internal void
@@ -497,6 +834,11 @@ rb_thread_entry_point(void *p)
   };
   OutputKind output_kind = OutputKind_Null;
   String8 output_path = cmd_line_string(cmdline, str8_lit("out"));
+  String8 source_map_path = cmd_line_string(cmdline, str8_lit("source-map"));
+  if(source_map_path.size == 0)
+  {
+    source_map_path = cmd_line_string(cmdline, str8_lit("source-provenance"));
+  }
   {
     //- rjf: user manually specified output kind
     if(output_kind == OutputKind_Null)
@@ -631,6 +973,9 @@ rb_thread_entry_point(void *p)
           fprintf(stderr, "ARGUMENTS\n\n");
           
           fprintf(stderr, "--compress                       Compresses the RDI file's contents.\n");
+          fprintf(stderr, "\n");
+          fprintf(stderr, "--source-map:<path>              Applies a generated-source to original-source\n");
+          fprintf(stderr, "                                 line mapping before RDI output is written.\n");
           fprintf(stderr, "\n");
           fprintf(stderr, "--only:<comma delimited names>   Specifies that only the named subsets of debug\n");
           fprintf(stderr, "                                 information should be generated. See below for\n");
@@ -929,6 +1274,16 @@ rb_thread_entry_point(void *p)
         }
       }
       lane_sync_u64(&bake_params, 0);
+      
+      //- source provenance maps generated source locations back to original source
+      RB_SourceMap *source_map = 0;
+      if(lane_idx() == 0 && source_map_path.size != 0)
+      {
+        source_map = push_array(arena, RB_SourceMap, 1);
+        *source_map = rb_source_map_from_path(arena, source_map_path);
+        rb_apply_source_map_to_bake_params(arena, bake_params, source_map);
+      }
+      lane_sync();
       
       //- rjf: no output path? -> pick one based on input files
       if(output_path.size == 0)
