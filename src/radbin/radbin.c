@@ -21,61 +21,278 @@ struct RB_SourceMapEntry
   U32 original_line_last;
 };
 
+typedef struct RB_SourceMapFile RB_SourceMapFile;
+struct RB_SourceMapFile
+{
+  RB_SourceMapFile *next;
+  U32 id;
+  String8 path;
+};
+
 typedef struct RB_SourceMap RB_SourceMap;
 struct RB_SourceMap
 {
   RB_SourceMapEntry *first;
   RB_SourceMapEntry *last;
   U64 count;
+  RB_SourceMapFile *first_file;
+  RB_SourceMapFile *last_file;
+  U64 file_count;
 };
 
-internal B32
-rb_source_map_token_from_line(String8 *line, String8 *token_out)
+typedef struct RB_CSVRow RB_CSVRow;
+struct RB_CSVRow
 {
-  String8 l = str8_skip_chop_whitespace(*line);
-  B32 result = 0;
-  if(l.size != 0)
+  String8 *fields;
+  U64 count;
+};
+
+typedef struct RB_SourceMapCSVColumns RB_SourceMapCSVColumns;
+struct RB_SourceMapCSVColumns
+{
+  U64 record;
+  U64 id;
+  U64 path;
+  U64 gen_file;
+  U64 gen_first;
+  U64 gen_last;
+  U64 orig_file;
+  U64 orig_first;
+  U64 orig_last;
+};
+
+internal String8 rb_source_map_resolved_path(Arena *arena, String8 map_dir, String8 path);
+
+internal String8
+rb_csv_row_field(RB_CSVRow *row, U64 idx)
+{
+  String8 result = {0};
+  if(idx < row->count)
   {
-    U64 token_opl = 0;
-    for(; token_opl < l.size && !char_is_space(l.str[token_opl]); token_opl += 1);
-    *token_out = str8_prefix(l, token_opl);
-    *line = str8_skip(l, token_opl);
+    result = row->fields[idx];
+  }
+  return result;
+}
+
+internal B32
+rb_csv_row_u64(RB_CSVRow *row, U64 idx, U64 *out)
+{
+  B32 result = 0;
+  String8 field = rb_csv_row_field(row, idx);
+  if(field.size != 0)
+  {
+    result = try_u64_from_str8_c_rules(field, out);
+  }
+  return result;
+}
+
+internal RB_CSVRow
+rb_csv_row_from_line(Arena *arena, String8 line)
+{
+  RB_CSVRow result = {0};
+  result.fields = push_array(arena, String8, 128);
+  U64 pos = 0;
+  for(;;)
+  {
+    if(result.count >= 128)
+    {
+      break;
+    }
+    
+    String8 field = {0};
+    if(pos < line.size && line.str[pos] == '"')
+    {
+      pos += 1;
+      U64 field_start = pos;
+      B32 closed_quote = 0;
+      String8List parts = {0};
+      for(; pos < line.size;)
+      {
+        if(line.str[pos] == '"')
+        {
+          if(pos+1 < line.size && line.str[pos+1] == '"')
+          {
+            str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+            str8_list_push(arena, &parts, str8_lit("\""));
+            pos += 2;
+            field_start = pos;
+          }
+          else
+          {
+            str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+            pos += 1;
+            closed_quote = 1;
+            break;
+          }
+        }
+        else
+        {
+          pos += 1;
+        }
+      }
+      if(!closed_quote && field_start < line.size && pos >= line.size)
+      {
+        str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+      }
+      field = str8_list_join(arena, &parts, 0);
+      for(; pos < line.size && char_is_space(line.str[pos]); pos += 1);
+    }
+    else
+    {
+      U64 field_start = pos;
+      for(; pos < line.size && line.str[pos] != ','; pos += 1);
+      field = str8_skip_chop_whitespace(str8_substr(line, r1u64(field_start, pos)));
+    }
+    
+    result.fields[result.count] = field;
+    result.count += 1;
+    
+    if(pos < line.size && line.str[pos] == ',')
+    {
+      pos += 1;
+      if(pos <= line.size)
+      {
+        continue;
+      }
+    }
+    break;
+  }
+  return result;
+}
+
+internal U64
+rb_csv_row_column_idx(RB_CSVRow *row, String8 name)
+{
+  U64 result = max_U64;
+  for(U64 idx = 0; idx < row->count; idx += 1)
+  {
+    if(str8_match(row->fields[idx], name, StringMatchFlag_CaseInsensitive))
+    {
+      result = idx;
+      break;
+    }
+  }
+  return result;
+}
+
+internal RB_SourceMapCSVColumns
+rb_source_map_csv_columns_from_header(RB_CSVRow *header)
+{
+  RB_SourceMapCSVColumns result = {0};
+  MemorySet(&result, 0xff, sizeof(result));
+  result.record     = rb_csv_row_column_idx(header, str8_lit("record"));
+  result.id         = rb_csv_row_column_idx(header, str8_lit("id"));
+  result.path       = rb_csv_row_column_idx(header, str8_lit("path"));
+  result.gen_file   = rb_csv_row_column_idx(header, str8_lit("gen_file"));
+  result.gen_first  = rb_csv_row_column_idx(header, str8_lit("gen_first"));
+  result.gen_last   = rb_csv_row_column_idx(header, str8_lit("gen_last"));
+  result.orig_file  = rb_csv_row_column_idx(header, str8_lit("orig_file"));
+  result.orig_first = rb_csv_row_column_idx(header, str8_lit("orig_first"));
+  result.orig_last  = rb_csv_row_column_idx(header, str8_lit("orig_last"));
+  return result;
+}
+
+internal B32
+rb_source_map_csv_columns_are_valid(RB_SourceMapCSVColumns *cols)
+{
+  B32 result = (cols->record     != max_U64 &&
+                cols->id         != max_U64 &&
+                cols->path       != max_U64 &&
+                cols->gen_file   != max_U64 &&
+                cols->gen_first  != max_U64 &&
+                cols->gen_last   != max_U64 &&
+                cols->orig_file  != max_U64 &&
+                cols->orig_first != max_U64 &&
+                cols->orig_last  != max_U64);
+  return result;
+}
+
+internal RB_SourceMapFile *
+rb_source_map_file_from_id(RB_SourceMap *map, U64 id)
+{
+  RB_SourceMapFile *result = 0;
+  for(RB_SourceMapFile *file = map->first_file; file != 0; file = file->next)
+  {
+    if(file->id == id)
+    {
+      result = file;
+      break;
+    }
+  }
+  return result;
+}
+
+internal void
+rb_source_map_push_file(Arena *arena, RB_SourceMap *map, U32 id, String8 path)
+{
+  RB_SourceMapFile *file = push_array(arena, RB_SourceMapFile, 1);
+  file->id = id;
+  file->path = path;
+  SLLQueuePush(map->first_file, map->last_file, file);
+  map->file_count += 1;
+}
+
+internal B32
+rb_source_map_push_entry(Arena *arena, RB_SourceMap *map, String8 generated_path, U64 generated_first, U64 generated_last, String8 original_path, U64 original_first, U64 original_last)
+{
+  B32 result = 0;
+  if(generated_first <= generated_last &&
+     original_first <= original_last &&
+     generated_first <= max_U32 &&
+     generated_last <= max_U32 &&
+     original_first <= max_U32 &&
+     original_last <= max_U32)
+  {
+    RB_SourceMapEntry *entry = push_array(arena, RB_SourceMapEntry, 1);
+    entry->generated_path = generated_path;
+    entry->generated_line_first = (U32)generated_first;
+    entry->generated_line_last = (U32)generated_last;
+    entry->original_path = original_path;
+    entry->original_line_first = (U32)original_first;
+    entry->original_line_last = (U32)original_last;
+    SLLQueuePush(map->first, map->last, entry);
+    map->count += 1;
     result = 1;
   }
   return result;
 }
 
 internal B32
-rb_source_map_parse_line(String8 line, String8 *generated_path_out, U64 *generated_first_out, U64 *generated_last_out, String8 *original_path_out, U64 *original_first_out, U64 *original_last_out)
+rb_source_map_parse_file_row(Arena *arena, RB_SourceMap *map, String8 map_dir, RB_SourceMapCSVColumns *cols, RB_CSVRow *row)
 {
   B32 result = 0;
-  String8 tokens[6] = {0};
-  U64 token_count = 0;
-  for(; token_count < ArrayCount(tokens) && rb_source_map_token_from_line(&line, &tokens[token_count]); token_count += 1);
-  if(token_count == 6)
+  U64 id = 0;
+  String8 path = rb_csv_row_field(row, cols->path);
+  if(rb_csv_row_u64(row, cols->id, &id) && id <= max_U32 && path.size != 0)
   {
-    U64 generated_first = 0;
-    U64 generated_last = 0;
-    U64 original_first = 0;
-    U64 original_last = 0;
-    if(try_u64_from_str8_c_rules(tokens[1], &generated_first) &&
-       try_u64_from_str8_c_rules(tokens[2], &generated_last) &&
-       try_u64_from_str8_c_rules(tokens[4], &original_first) &&
-       try_u64_from_str8_c_rules(tokens[5], &original_last) &&
-       generated_first <= generated_last &&
-       original_first <= original_last &&
-       generated_first <= max_U32 &&
-       generated_last <= max_U32 &&
-       original_first <= max_U32 &&
-       original_last <= max_U32)
+    rb_source_map_push_file(arena, map, (U32)id, rb_source_map_resolved_path(arena, map_dir, path));
+    result = 1;
+  }
+  return result;
+}
+
+internal B32
+rb_source_map_parse_map_row(Arena *arena, RB_SourceMap *map, RB_SourceMapCSVColumns *cols, RB_CSVRow *row)
+{
+  B32 result = 0;
+  U64 generated_file_id = 0;
+  U64 generated_first = 0;
+  U64 generated_last = 0;
+  U64 original_file_id = 0;
+  U64 original_first = 0;
+  U64 original_last = 0;
+  if(rb_csv_row_u64(row, cols->gen_file, &generated_file_id) &&
+     rb_csv_row_u64(row, cols->gen_first, &generated_first) &&
+     rb_csv_row_u64(row, cols->gen_last, &generated_last) &&
+     rb_csv_row_u64(row, cols->orig_file, &original_file_id) &&
+     rb_csv_row_u64(row, cols->orig_first, &original_first) &&
+     rb_csv_row_u64(row, cols->orig_last, &original_last))
+  {
+    RB_SourceMapFile *generated_file = rb_source_map_file_from_id(map, generated_file_id);
+    RB_SourceMapFile *original_file = rb_source_map_file_from_id(map, original_file_id);
+    if(generated_file != 0 && original_file != 0)
     {
-      *generated_path_out = tokens[0];
-      *generated_first_out = generated_first;
-      *generated_last_out = generated_last;
-      *original_path_out = tokens[3];
-      *original_first_out = original_first;
-      *original_last_out = original_last;
-      result = 1;
+      result = rb_source_map_push_entry(arena, map, generated_file->path, generated_first, generated_last, original_file->path, original_first, original_last);
     }
   }
   return result;
@@ -102,6 +319,8 @@ rb_source_map_from_path(Arena *arena, String8 path)
   }
   else
   {
+    B32 have_header = 0;
+    RB_SourceMapCSVColumns cols = {0};
     U64 line_num = 0;
     for(String8 remaining = data; remaining.size != 0;)
     {
@@ -112,33 +331,47 @@ rb_source_map_from_path(Arena *arena, String8 path)
       {
         continue;
       }
-      if(str8_match(str8_prefix(line, str8_lit("source-map").size), str8_lit("source-map"), StringMatchFlag_CaseInsensitive) ||
-         str8_match(str8_prefix(line, str8_lit("source-provenance").size), str8_lit("source-provenance"), StringMatchFlag_CaseInsensitive))
+      
+      RB_CSVRow row = rb_csv_row_from_line(arena, line);
+      if(row.count == 0)
       {
         continue;
       }
       
-      String8 generated_path = {0};
-      String8 original_path = {0};
-      U64 generated_first = 0;
-      U64 generated_last = 0;
-      U64 original_first = 0;
-      U64 original_last = 0;
-      if(rb_source_map_parse_line(line, &generated_path, &generated_first, &generated_last, &original_path, &original_first, &original_last))
+      if(!have_header)
       {
-        RB_SourceMapEntry *entry = push_array(arena, RB_SourceMapEntry, 1);
-        entry->generated_path = rb_source_map_resolved_path(arena, map_dir, generated_path);
-        entry->generated_line_first = (U32)generated_first;
-        entry->generated_line_last = (U32)generated_last;
-        entry->original_path = rb_source_map_resolved_path(arena, map_dir, original_path);
-        entry->original_line_first = (U32)original_first;
-        entry->original_line_last = (U32)original_last;
-        SLLQueuePush(result.first, result.last, entry);
-        result.count += 1;
+        cols = rb_source_map_csv_columns_from_header(&row);
+        have_header = rb_source_map_csv_columns_are_valid(&cols);
+        if(!have_header)
+        {
+          log_user_errorf("Could not parse source map `%S` line %I64u. Expected Source Provenance CSV v1 header.", full_path, line_num);
+          break;
+        }
+        continue;
+      }
+      
+      String8 record = rb_csv_row_field(&row, cols.record);
+      if(str8_match(record, str8_lit("version"), StringMatchFlag_CaseInsensitive))
+      {
+        continue;
+      }
+      else if(str8_match(record, str8_lit("file"), StringMatchFlag_CaseInsensitive))
+      {
+        if(!rb_source_map_parse_file_row(arena, &result, map_dir, &cols, &row))
+        {
+          log_user_errorf("Could not parse source map `%S` line %I64u. Invalid file row.", full_path, line_num);
+        }
+      }
+      else if(str8_match(record, str8_lit("map"), StringMatchFlag_CaseInsensitive))
+      {
+        if(!rb_source_map_parse_map_row(arena, &result, &cols, &row))
+        {
+          log_user_errorf("Could not parse source map `%S` line %I64u. Invalid map row.", full_path, line_num);
+        }
       }
       else
       {
-        log_user_errorf("Could not parse source map `%S` line %I64u. Expected: generated_path generated_first generated_last original_path original_first original_last.", full_path, line_num);
+        log_user_errorf("Could not parse source map `%S` line %I64u. Unknown record `%S`.", full_path, line_num, record);
       }
     }
   }

@@ -37,6 +37,290 @@ rd_regs_copy(Arena *arena, RD_Regs *src)
 }
 
 ////////////////////////////////
+//~ Source Navigation Helpers
+
+typedef struct RD_SourceNavCSVRow RD_SourceNavCSVRow;
+struct RD_SourceNavCSVRow
+{
+  String8 *fields;
+  U64 count;
+};
+
+typedef struct RD_SourceNavCSVColumns RD_SourceNavCSVColumns;
+struct RD_SourceNavCSVColumns
+{
+  U64 record;
+  U64 id;
+  U64 path;
+  U64 name;
+  U64 ref_file;
+  U64 ref_first;
+  U64 ref_last;
+  U64 def_file;
+  U64 def_first;
+  U64 def_last;
+};
+
+typedef struct RD_SourceNavFile RD_SourceNavFile;
+struct RD_SourceNavFile
+{
+  U64 id;
+  String8 path;
+};
+
+typedef struct RD_SourceNavResult RD_SourceNavResult;
+struct RD_SourceNavResult
+{
+  B32 found;
+  String8 file_path;
+  U64 line_num;
+};
+
+internal String8
+rd_source_nav_csv_row_field(RD_SourceNavCSVRow *row, U64 idx)
+{
+  String8 result = {0};
+  if(idx < row->count)
+  {
+    result = row->fields[idx];
+  }
+  return result;
+}
+
+internal B32
+rd_source_nav_csv_row_u64(RD_SourceNavCSVRow *row, U64 idx, U64 *out)
+{
+  B32 result = 0;
+  String8 field = rd_source_nav_csv_row_field(row, idx);
+  if(field.size != 0)
+  {
+    result = try_u64_from_str8_c_rules(field, out);
+  }
+  return result;
+}
+
+internal RD_SourceNavCSVRow
+rd_source_nav_csv_row_from_line(Arena *arena, String8 line)
+{
+  RD_SourceNavCSVRow result = {0};
+  result.fields = push_array(arena, String8, 64);
+  U64 pos = 0;
+  for(;;)
+  {
+    if(result.count >= 64)
+    {
+      break;
+    }
+    
+    String8 field = {0};
+    if(pos < line.size && line.str[pos] == '"')
+    {
+      pos += 1;
+      U64 field_start = pos;
+      B32 closed_quote = 0;
+      String8List parts = {0};
+      for(; pos < line.size;)
+      {
+        if(line.str[pos] == '"')
+        {
+          if(pos+1 < line.size && line.str[pos+1] == '"')
+          {
+            str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+            str8_list_push(arena, &parts, str8_lit("\""));
+            pos += 2;
+            field_start = pos;
+          }
+          else
+          {
+            str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+            pos += 1;
+            closed_quote = 1;
+            break;
+          }
+        }
+        else
+        {
+          pos += 1;
+        }
+      }
+      if(!closed_quote && field_start < line.size && pos >= line.size)
+      {
+        str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+      }
+      field = str8_list_join(arena, &parts, 0);
+      for(; pos < line.size && char_is_space(line.str[pos]); pos += 1);
+    }
+    else
+    {
+      U64 field_start = pos;
+      for(; pos < line.size && line.str[pos] != ','; pos += 1);
+      field = str8_skip_chop_whitespace(str8_substr(line, r1u64(field_start, pos)));
+    }
+    
+    result.fields[result.count] = field;
+    result.count += 1;
+    
+    if(pos < line.size && line.str[pos] == ',')
+    {
+      pos += 1;
+      if(pos <= line.size)
+      {
+        continue;
+      }
+    }
+    break;
+  }
+  return result;
+}
+
+internal U64
+rd_source_nav_csv_row_column_idx(RD_SourceNavCSVRow *row, String8 name)
+{
+  U64 result = max_U64;
+  for(U64 idx = 0; idx < row->count; idx += 1)
+  {
+    if(str8_match(row->fields[idx], name, StringMatchFlag_CaseInsensitive))
+    {
+      result = idx;
+      break;
+    }
+  }
+  return result;
+}
+
+internal RD_SourceNavCSVColumns
+rd_source_nav_csv_columns_from_header(RD_SourceNavCSVRow *header)
+{
+  RD_SourceNavCSVColumns result = {0};
+  MemorySet(&result, 0xff, sizeof(result));
+  result.record    = rd_source_nav_csv_row_column_idx(header, str8_lit("record"));
+  result.id        = rd_source_nav_csv_row_column_idx(header, str8_lit("id"));
+  result.path      = rd_source_nav_csv_row_column_idx(header, str8_lit("path"));
+  result.name      = rd_source_nav_csv_row_column_idx(header, str8_lit("name"));
+  result.ref_file  = rd_source_nav_csv_row_column_idx(header, str8_lit("ref_file"));
+  result.ref_first = rd_source_nav_csv_row_column_idx(header, str8_lit("ref_first"));
+  result.ref_last  = rd_source_nav_csv_row_column_idx(header, str8_lit("ref_last"));
+  result.def_file  = rd_source_nav_csv_row_column_idx(header, str8_lit("def_file"));
+  result.def_first = rd_source_nav_csv_row_column_idx(header, str8_lit("def_first"));
+  result.def_last  = rd_source_nav_csv_row_column_idx(header, str8_lit("def_last"));
+  return result;
+}
+
+internal B32
+rd_source_nav_csv_columns_are_valid(RD_SourceNavCSVColumns *cols)
+{
+  B32 result = (cols->record    != max_U64 &&
+                cols->id        != max_U64 &&
+                cols->path      != max_U64 &&
+                cols->name      != max_U64 &&
+                cols->ref_file  != max_U64 &&
+                cols->ref_first != max_U64 &&
+                cols->ref_last  != max_U64 &&
+                cols->def_file  != max_U64 &&
+                cols->def_first != max_U64 &&
+                cols->def_last  != max_U64);
+  return result;
+}
+
+internal String8
+rd_source_nav_file_path_from_id(RD_SourceNavFile *files, U64 files_count, U64 id)
+{
+  String8 result = {0};
+  for(U64 idx = 0; idx < files_count; idx += 1)
+  {
+    if(files[idx].id == id)
+    {
+      result = files[idx].path;
+      break;
+    }
+  }
+  return result;
+}
+
+internal B32
+rd_source_nav_lookup(Arena *arena, String8 nav_path, String8 current_file_path, U64 current_line_num, String8 name, RD_SourceNavResult *result_out)
+{
+  B32 result = 0;
+  if(nav_path.size != 0 && name.size != 0)
+  {
+    Temp scratch = scratch_begin(&arena, 1);
+    String8 full_path = full_path_from_path(scratch.arena, nav_path);
+    String8 nav_dir = str8_chop_last_slash(full_path);
+    String8 data = data_from_file_path(scratch.arena, full_path);
+    if(data.size != 0)
+    {
+      RD_SourceNavFile *files = push_array(scratch.arena, RD_SourceNavFile, 4096);
+      U64 files_count = 0;
+      B32 have_header = 0;
+      RD_SourceNavCSVColumns cols = {0};
+      for(String8 remaining = data; remaining.size != 0 && !result;)
+      {
+        String8 raw_line = str8_chop_line(&remaining);
+        String8 line = str8_skip_chop_whitespace(raw_line);
+        if(line.size == 0 || str8_match(str8_prefix(line, 1), str8_lit("#"), 0))
+        {
+          continue;
+        }
+        
+        RD_SourceNavCSVRow row = rd_source_nav_csv_row_from_line(scratch.arena, line);
+        if(!have_header)
+        {
+          cols = rd_source_nav_csv_columns_from_header(&row);
+          have_header = rd_source_nav_csv_columns_are_valid(&cols);
+          continue;
+        }
+        
+        String8 record = rd_source_nav_csv_row_field(&row, cols.record);
+        if(str8_match(record, str8_lit("file"), StringMatchFlag_CaseInsensitive))
+        {
+          U64 id = 0;
+          String8 path = rd_source_nav_csv_row_field(&row, cols.path);
+          if(files_count < 4096 && rd_source_nav_csv_row_u64(&row, cols.id, &id) && path.size != 0)
+          {
+            String8 resolved_path = path_absolute_dst_from_relative_dst_src(scratch.arena, path, nav_dir);
+            resolved_path = path_normalized_from_string(scratch.arena, resolved_path);
+            files[files_count++] = (RD_SourceNavFile){id, resolved_path};
+          }
+        }
+        else if(str8_match(record, str8_lit("ref"), StringMatchFlag_CaseInsensitive))
+        {
+          String8 row_name = rd_source_nav_csv_row_field(&row, cols.name);
+          U64 ref_file_id = 0;
+          U64 ref_first = 0;
+          U64 ref_last = 0;
+          U64 def_file_id = 0;
+          U64 def_first = 0;
+          if(str8_match(row_name, name, 0) &&
+             rd_source_nav_csv_row_u64(&row, cols.ref_file, &ref_file_id) &&
+             rd_source_nav_csv_row_u64(&row, cols.ref_first, &ref_first) &&
+             rd_source_nav_csv_row_u64(&row, cols.ref_last, &ref_last) &&
+             rd_source_nav_csv_row_u64(&row, cols.def_file, &def_file_id) &&
+             rd_source_nav_csv_row_u64(&row, cols.def_first, &def_first))
+          {
+            String8 ref_path = rd_source_nav_file_path_from_id(files, files_count, ref_file_id);
+            String8 def_path = rd_source_nav_file_path_from_id(files, files_count, def_file_id);
+            B32 line_matches = (current_line_num == 0 || (ref_first <= current_line_num && current_line_num <= ref_last));
+            B32 file_matches = (current_file_path.size == 0 || path_match_normalized(ref_path, current_file_path));
+            if(line_matches && file_matches && def_path.size != 0)
+            {
+              result = 1;
+              if(result_out)
+              {
+                result_out->found = 1;
+                result_out->file_path = push_str8_copy(arena, def_path);
+                result_out->line_num = def_first;
+              }
+            }
+          }
+        }
+      }
+    }
+    scratch_end(scratch);
+  }
+  return result;
+}
+
+////////////////////////////////
 //~ rjf: Commands Type Functions
 
 internal void
@@ -15256,6 +15540,37 @@ rd_frame(void)
                 name = str8_skip(str8_chop(name, 1), 1);
               }
               
+              // rjf: try to resolve name through source navigation metadata
+              String8 file_path = {0};
+              U64 file_line_num = 0;
+              if(!name_resolved && di_shared->source_nav_path.size != 0)
+              {
+                String8 nav_name = name;
+                if(nav_name.size >= 1 && nav_name.str[0] == '@')
+                {
+                  nav_name = str8_skip(nav_name, 1);
+                }
+                String8 current_file_path = rd_regs()->file_path;
+                U64 current_line_num = rd_regs()->line_num;
+                C_Key zero_text_key = {0};
+                if(current_line_num == 0 && !c_key_match(rd_regs()->text_key, zero_text_key))
+                {
+                  Access *access = access_open();
+                  U128 hash = {0};
+                  TXT_TextInfo info = txt_text_info_from_key_lang(access, rd_regs()->text_key, rd_regs()->lang_kind, &hash);
+                  TxtPt pt = txt_pt_from_off__linear_scan(&info, 0, rd_regs()->cursor);
+                  current_line_num = (U64)pt.line;
+                  access_close(access);
+                }
+                RD_SourceNavResult nav = {0};
+                if(rd_source_nav_lookup(scratch.arena, di_shared->source_nav_path, current_file_path, current_line_num, nav_name, &nav))
+                {
+                  name_resolved = 1;
+                  file_path = nav.file_path;
+                  file_line_num = nav.line_num;
+                }
+              }
+              
               // rjf: try to resolve name as a symbol
               U64 voff = 0;
               DI_Key voff_dbgi_key = {0};
@@ -15285,7 +15600,6 @@ rd_frame(void)
               }
               
               // rjf: try to resolve name as a file
-              String8 file_path = {0};
               if(!name_resolved)
               {
                 // rjf: unpack quoted portion of string
@@ -15364,7 +15678,7 @@ rd_frame(void)
               // rjf: name resolved to a file path
               if(name_resolved && file_path.size != 0)
               {
-                rd_cmd(RD_CmdKind_FindCodeLocation, .file_path = file_path, .line_num = 0, .vaddr = 0);
+                rd_cmd(RD_CmdKind_FindCodeLocation, .file_path = file_path, .line_num = file_line_num, .vaddr = 0);
               }
             }
           }break;
@@ -16775,11 +17089,18 @@ rd_frame(void)
             U128 hash = {0};
             TXT_TextInfo info = txt_text_info_from_key_lang(access, text_key, lang_kind, &hash);
             String8 data = c_data_from_hash(access, hash);
+            TxtPt pt = txt_pt_from_off__linear_scan(&info, 0, regs->cursor);
+            if(range.min == range.max)
+            {
+              range = txt_expr_off_range_from_info_data_pt(&info, data, pt);
+            }
             String8 expr = str8_substr(data, range);
             rd_cmd((kind == RD_CmdKind_GoToNameAtCursor ? RD_CmdKind_GoToName :
                     kind == RD_CmdKind_ToggleWatchExpressionAtCursor ? RD_CmdKind_ToggleWatchExpression :
                     RD_CmdKind_GoToName),
-                   .string = expr);
+                   .string = expr,
+                   .file_path = regs->file_path,
+                   .line_num = (U64)pt.line);
             access_close(access);
           }break;
           case RD_CmdKind_SetNextStatement:

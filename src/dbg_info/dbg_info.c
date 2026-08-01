@@ -72,6 +72,17 @@ di_init(CmdLine *cmdline)
       di_shared->source_map_path = str8_copy(arena, path_normalized_from_string(scratch.arena, full_path_from_path(scratch.arena, source_map_path)));
       scratch_end(scratch);
     }
+    String8 source_nav_path = cmd_line_string(cmdline, str8_lit("source-nav"));
+    if(source_nav_path.size != 0)
+    {
+      Temp scratch = scratch_begin(&arena, 1);
+      di_shared->source_nav_path = str8_copy(arena, path_normalized_from_string(scratch.arena, full_path_from_path(scratch.arena, source_nav_path)));
+      scratch_end(scratch);
+    }
+    else if(di_shared->source_map_path.size != 0)
+    {
+      di_shared->source_nav_path = str8_copy(arena, path_replace_file_extension(arena, di_shared->source_map_path, str8_lit("srcnav")));
+    }
   }
   for EachElement(idx, di_shared->req_batches)
   {

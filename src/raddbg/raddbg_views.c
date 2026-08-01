@@ -914,7 +914,11 @@ rd_code_view_build(Arena *arena, RD_CodeViewState *cv, RD_CodeViewBuildFlags fla
     if(ui_pressed(sig.base) && sig.base.event_flags & WM_Modifier_Ctrl)
     {
       ui_kill_action();
-      rd_cmd(RD_CmdKind_GoToName, .string = memory_map_data_from_range(scratch.arena, &text_patched.memory_map, sig.mouse_expr_rng));
+      U64 mouse_line_num = txt_line_num_from_off(&text_patched.line_map, sig.mouse_off);
+      rd_cmd(RD_CmdKind_GoToName,
+             .string = memory_map_data_from_range(scratch.arena, &text_patched.memory_map, sig.mouse_expr_rng),
+             .file_path = file_path,
+             .line_num = mouse_line_num);
     }
     
     //- rjf: watch expr at mouse
