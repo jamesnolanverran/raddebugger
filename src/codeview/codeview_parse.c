@@ -1503,10 +1503,16 @@ cv_c13_parsed_from_data(Arena *arena, String8 c13_data, String8 strtbl, COFF_Sec
           // parse lines
           U64 *voffs = push_array_no_zero(arena, U64, line_count + 1);
           U32 *line_nums = push_array_no_zero(arena, U32, line_count);
+          U16 *col_nums = 0;
           
           {
             CV_C13Line *line_ptr = (CV_C13Line*)(first + line_array_off);
             CV_C13Line *line_opl = line_ptr + line_count;
+            CV_C13Column *col_ptr = (has_cols ? (CV_C13Column *)(first + col_array_off) : 0);
+            if(has_cols)
+            {
+              col_nums = push_array_no_zero(arena, U16, 2*line_count);
+            }
             
             // TODO(allen): check order correctness here
             
@@ -1514,6 +1520,11 @@ cv_c13_parsed_from_data(Arena *arena, String8 c13_data, String8 strtbl, COFF_Sec
             for (; line_ptr < line_opl; line_ptr += 1, i += 1){
               voffs[i] = line_ptr->off + secrel_off + sec_base_off;
               line_nums[i] = CV_C13LineFlags_Extract_LineNumber(line_ptr->flags);
+              if(col_nums != 0)
+              {
+                col_nums[2*i + 0] = col_ptr[i].start;
+                col_nums[2*i + 1] = col_ptr[i].end;
+              }
             }
             voffs[i] = secrel_opl + sec_base_off;
           }
@@ -1529,6 +1540,7 @@ cv_c13_parsed_from_data(Arena *arena, String8 c13_data, String8 strtbl, COFF_Sec
           lines_parsed->checksum        = checksum_value;
           lines_parsed->voffs           = voffs;
           lines_parsed->line_nums       = line_nums;
+          lines_parsed->col_nums        = col_nums;
           lines_parsed->line_count      = line_count;
           SLLQueuePush(node->lines_first, node->lines_last, lines_parsed_node);
           

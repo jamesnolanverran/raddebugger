@@ -776,10 +776,10 @@ rdim_line_table_push_sequence(RDIM_Arena *arena, RDIM_LineTableChunkList *line_t
   SLLQueuePush(line_table->first_seq, line_table->last_seq, n);
   line_table->seq_count += 1;
   line_table->line_count += line_count;
-  line_table->col_count += line_count*2*(col_nums != 0);
+  line_table->col_count += line_count*(col_nums != 0);
   line_tables->total_seq_count += 1;
   line_tables->total_line_count += line_count;
-  line_tables->total_col_count += line_count*2*(col_nums != 0);
+  line_tables->total_col_count += line_count*(col_nums != 0);
   return &n->v;
 }
 
