@@ -914,32 +914,6 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
   // rjf: line vaddr range => did we find anything successfully?
   B32 good_line_info = (line_vaddr_rng.max != 0);
   
-  // rjf: line vaddr range => line's machine code
-  String8 machine_code = {0};
-  B32 good_machine_code = 0;
-  if(good_line_info)
-  {
-    D_ProcessMemorySlice machine_code_slice = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, line_vaddr_rng, 1, now_time_us()+10000);
-    machine_code = machine_code_slice.data;
-    good_machine_code = (machine_code.size >= dim_1u64(line_vaddr_rng) && !machine_code_slice.any_byte_bad && !machine_code_slice.stale);
-  }
-  
-  // rjf: machine code => ctrl flow analysis
-  DASM_CtrlFlowInfo ctrl_flow_info = {0};
-  if(good_machine_code)
-  {
-    ctrl_flow_info = dasm_ctrl_flow_info_from_arch_vaddr_code(scratch.arena,
-                                                              DASM_InstFlag_Call|
-                                                              DASM_InstFlag_Branch|
-                                                              DASM_InstFlag_UnconditionalJump|
-                                                              DASM_InstFlag_ChangesStackPointer|
-                                                              DASM_InstFlag_Return,
-                                                              0,
-                                                              arch,
-                                                              line_vaddr_rng.min,
-                                                              machine_code);
-  }
-  
   // rjf: source provenance policy for this module, keyed by voff ranges
   D_SourcePolicyList source_policy = {0};
   {
@@ -947,93 +921,133 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
     source_policy = d_source_policy_list_from_path(scratch.arena, source_policy_path);
   }
 
-  // rjf: determine last 
-  DASM_CtrlFlowPoint *last_call_point = 0;
-  if(good_machine_code) for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+  // rjf: line vaddr ranges => line's machine code
+  B32 good_machine_code = 0;
+  if(good_line_info) for EachNode(range_n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
   {
-    if(n->v.inst_flags & DASM_InstFlag_Call)
+    Rng1U64 scan_vaddr_rng = range_n->v;
+    if(scan_vaddr_rng.max <= ip_vaddr)
     {
-      last_call_point = &n->v;
+      continue;
     }
-  }
-  
-  // rjf: push traps for all exit points
-  if(good_machine_code) for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
-  {
-    DASM_CtrlFlowPoint *point = &n->v;
-    D_TrapFlags flags = 0;
-    B32 add = 1;
-    U64 trap_addr = point->vaddr;
-    B32 call_is_opaque = ((point->inst_flags & DASM_InstFlag_Call) &&
-                          d_source_policy_list_voff_is_opaque(&source_policy, d_voff_from_vaddr(module, point->vaddr)));
-    if(call_is_opaque)
+    if(scan_vaddr_rng.min < ip_vaddr)
     {
-      add = 0;
+      scan_vaddr_rng.min = ip_vaddr;
     }
-    
-    // rjf: if this is not the last call instruction in the control flow,
-    // and if we have no line info for this address, then do not add.
-    if(point != last_call_point &&
-       point->inst_flags & DASM_InstFlag_Call &&
-       point->jump_dest_vaddr != 0)
+    if(scan_vaddr_rng.min >= scan_vaddr_rng.max)
     {
-      U64 jump_dest_vaddr = point->jump_dest_vaddr;
-      D_Entity *jump_dest_module = d_module_from_process_vaddr(process, jump_dest_vaddr);
-      U64 jump_dest_voff = d_voff_from_vaddr(jump_dest_module, jump_dest_vaddr);
-      DI_Key jump_dest_dbgi_key = d_dbgi_key_from_module(jump_dest_module);
-      D_LineList lines = d_lines_from_dbgi_key_voff(scratch.arena, jump_dest_dbgi_key, jump_dest_voff);
-      if(lines.count == 0)
+      continue;
+    }
+
+    D_ProcessMemorySlice machine_code_slice = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, scan_vaddr_rng, 1, now_time_us()+10000);
+    String8 machine_code = machine_code_slice.data;
+    B32 good_range_machine_code = (machine_code.size >= dim_1u64(scan_vaddr_rng) && !machine_code_slice.any_byte_bad && !machine_code_slice.stale);
+    if(!good_range_machine_code)
+    {
+      continue;
+    }
+    good_machine_code = 1;
+
+    // rjf: machine code => ctrl flow analysis
+    DASM_CtrlFlowInfo ctrl_flow_info = dasm_ctrl_flow_info_from_arch_vaddr_code(scratch.arena,
+                                                                                DASM_InstFlag_Call|
+                                                                                DASM_InstFlag_Branch|
+                                                                                DASM_InstFlag_UnconditionalJump|
+                                                                                DASM_InstFlag_ChangesStackPointer|
+                                                                                DASM_InstFlag_Return,
+                                                                                0,
+                                                                                arch,
+                                                                                scan_vaddr_rng.min,
+                                                                                machine_code);
+
+    // rjf: determine last
+    DASM_CtrlFlowPoint *last_call_point = 0;
+    for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+    {
+      if(n->v.inst_flags & DASM_InstFlag_Call)
+      {
+        last_call_point = &n->v;
+      }
+    }
+
+    // rjf: push traps for all exit points
+    for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+    {
+      DASM_CtrlFlowPoint *point = &n->v;
+      D_TrapFlags flags = 0;
+      B32 add = 1;
+      U64 trap_addr = point->vaddr;
+      B32 call_is_opaque = ((point->inst_flags & DASM_InstFlag_Call) &&
+                            d_source_policy_list_voff_is_opaque(&source_policy, d_voff_from_vaddr(module, point->vaddr)));
+      if(call_is_opaque)
       {
         add = 0;
       }
-    }
-    
-    // rjf: branches/jumps/returns => single-step & end, OR trap @ destination.
-    if(point->inst_flags & (DASM_InstFlag_Call|
-                            DASM_InstFlag_Branch|
-                            DASM_InstFlag_UnconditionalJump|
-                            DASM_InstFlag_Return))
-    {
-      flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_EndStepping|D_TrapFlag_IgnoreStackPointerCheck);
-      
-      // rjf: omit if this jump stays inside of this line
-      if(contains_1u64(line_vaddr_rng, point->jump_dest_vaddr))
+
+      // rjf: if this is not the last call instruction in the control flow,
+      // and if we have no line info for this address, then do not add.
+      if(point != last_call_point &&
+         point->inst_flags & DASM_InstFlag_Call &&
+         point->jump_dest_vaddr != 0)
       {
-        add = 0;
-      }
-      
-      // rjf: omit if this jump stays inside of any range on this same textual line
-      for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
-      {
-        if(contains_1u64(n->v, point->jump_dest_vaddr))
+        U64 jump_dest_vaddr = point->jump_dest_vaddr;
+        D_Entity *jump_dest_module = d_module_from_process_vaddr(process, jump_dest_vaddr);
+        U64 jump_dest_voff = d_voff_from_vaddr(jump_dest_module, jump_dest_vaddr);
+        DI_Key jump_dest_dbgi_key = d_dbgi_key_from_module(jump_dest_module);
+        D_LineList lines = d_lines_from_dbgi_key_voff(scratch.arena, jump_dest_dbgi_key, jump_dest_voff);
+        if(lines.count == 0)
         {
           add = 0;
-          break;
         }
       }
-      
-      // rjf: trap @ destination, if we can - we can avoid a single-step this way.
-      if(point->jump_dest_vaddr != 0)
+
+      // rjf: branches/jumps/returns => single-step & end, OR trap @ destination.
+      if(point->inst_flags & (DASM_InstFlag_Call|
+                              DASM_InstFlag_Branch|
+                              DASM_InstFlag_UnconditionalJump|
+                              DASM_InstFlag_Return))
       {
-        trap_addr = point->jump_dest_vaddr;
-        flags &= ~D_TrapFlag_SingleStepAfterHit;
+        flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_EndStepping|D_TrapFlag_IgnoreStackPointerCheck);
+
+        // rjf: omit if this jump stays inside of this range
+        if(contains_1u64(scan_vaddr_rng, point->jump_dest_vaddr))
+        {
+          add = 0;
+        }
+
+        // rjf: omit if this jump stays inside of any range on this same textual line
+        for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+        {
+          if(contains_1u64(n->v, point->jump_dest_vaddr))
+          {
+            add = 0;
+            break;
+          }
+        }
+
+        // rjf: trap @ destination, if we can - we can avoid a single-step this way.
+        if(point->jump_dest_vaddr != 0)
+        {
+          trap_addr = point->jump_dest_vaddr;
+          flags &= ~D_TrapFlag_SingleStepAfterHit;
+        }
+      }
+
+      // rjf: instruction changes stack pointer => save off the stack pointer, single-step over, keep stepping
+      else if(point->inst_flags & DASM_InstFlag_ChangesStackPointer)
+      {
+        flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_SaveStackPointerAfter);
+      }
+
+      // rjf: add if appropriate
+      if(add)
+      {
+        D_Trap trap = {flags, trap_addr};
+        d_trap_list_push(arena, &result.traps, &trap);
       }
     }
-    
-    // rjf: instruction changes stack pointer => save off the stack pointer, single-step over, keep stepping
-    else if(point->inst_flags & DASM_InstFlag_ChangesStackPointer)
-    {
-      flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_SaveStackPointerAfter);
-    }
-    
-    // rjf: add if appropriate
-    if(add)
-    {
-      D_Trap trap = {flags, trap_addr};
-      d_trap_list_push(arena, &result.traps, &trap);
-    }
   }
-  
+
   // rjf: push traps for natural linear flow
   if(good_line_info && good_machine_code)
   {
