@@ -16,9 +16,13 @@ struct RB_SourceMapEntry
   String8 generated_path;
   U32 generated_line_first;
   U32 generated_line_last;
+  U32 generated_col_first;
+  U32 generated_col_opl;
   String8 original_path;
   U32 original_line_first;
   U32 original_line_last;
+  U32 original_col_first;
+  U32 original_col_opl;
   String8 kind;
 };
 
@@ -56,9 +60,13 @@ struct RB_SourceMapCSVColumns
   U64 gen_file;
   U64 gen_first;
   U64 gen_last;
+  U64 gen_col_first;
+  U64 gen_col_opl;
   U64 orig_file;
   U64 orig_first;
   U64 orig_last;
+  U64 orig_col_first;
+  U64 orig_col_opl;
   U64 kind;
 };
 
@@ -100,6 +108,17 @@ rb_csv_row_u64(RB_CSVRow *row, U64 idx, U64 *out)
   if(field.size != 0)
   {
     result = try_u64_from_str8_c_rules(field, out);
+  }
+  return result;
+}
+
+internal U64
+rb_csv_row_optional_u64(RB_CSVRow *row, U64 idx)
+{
+  U64 result = 0;
+  if(idx != max_U64)
+  {
+    rb_csv_row_u64(row, idx, &result);
   }
   return result;
 }
@@ -199,9 +218,13 @@ rb_source_map_csv_columns_from_header(RB_CSVRow *header)
   result.gen_file   = rb_csv_row_column_idx(header, str8_lit("gen_file"));
   result.gen_first  = rb_csv_row_column_idx(header, str8_lit("gen_first"));
   result.gen_last   = rb_csv_row_column_idx(header, str8_lit("gen_last"));
+  result.gen_col_first = rb_csv_row_column_idx(header, str8_lit("gen_col_first"));
+  result.gen_col_opl   = rb_csv_row_column_idx(header, str8_lit("gen_col_opl"));
   result.orig_file  = rb_csv_row_column_idx(header, str8_lit("orig_file"));
   result.orig_first = rb_csv_row_column_idx(header, str8_lit("orig_first"));
   result.orig_last  = rb_csv_row_column_idx(header, str8_lit("orig_last"));
+  result.orig_col_first = rb_csv_row_column_idx(header, str8_lit("orig_col_first"));
+  result.orig_col_opl   = rb_csv_row_column_idx(header, str8_lit("orig_col_opl"));
   result.kind       = rb_csv_row_column_idx(header, str8_lit("kind"));
   return result;
 }
@@ -248,23 +271,31 @@ rb_source_map_push_file(Arena *arena, RB_SourceMap *map, U32 id, String8 path)
 }
 
 internal B32
-rb_source_map_push_entry(Arena *arena, RB_SourceMap *map, String8 generated_path, U64 generated_first, U64 generated_last, String8 original_path, U64 original_first, U64 original_last, String8 kind)
+rb_source_map_push_entry(Arena *arena, RB_SourceMap *map, String8 generated_path, U64 generated_first, U64 generated_last, U64 generated_col_first, U64 generated_col_opl, String8 original_path, U64 original_first, U64 original_last, U64 original_col_first, U64 original_col_opl, String8 kind)
 {
   B32 result = 0;
   if(generated_first <= generated_last &&
      original_first <= original_last &&
      generated_first <= max_U32 &&
      generated_last <= max_U32 &&
+     generated_col_first <= max_U32 &&
+     generated_col_opl <= max_U32 &&
      original_first <= max_U32 &&
-     original_last <= max_U32)
+     original_last <= max_U32 &&
+     original_col_first <= max_U32 &&
+     original_col_opl <= max_U32)
   {
     RB_SourceMapEntry *entry = push_array(arena, RB_SourceMapEntry, 1);
     entry->generated_path = generated_path;
     entry->generated_line_first = (U32)generated_first;
     entry->generated_line_last = (U32)generated_last;
+    entry->generated_col_first = (U32)generated_col_first;
+    entry->generated_col_opl = (U32)generated_col_opl;
     entry->original_path = original_path;
     entry->original_line_first = (U32)original_first;
     entry->original_line_last = (U32)original_last;
+    entry->original_col_first = (U32)original_col_first;
+    entry->original_col_opl = (U32)original_col_opl;
     entry->kind = kind;
     SLLQueuePush(map->first, map->last, entry);
     map->count += 1;
@@ -308,8 +339,12 @@ rb_source_map_parse_map_row(Arena *arena, RB_SourceMap *map, RB_SourceMapCSVColu
     RB_SourceMapFile *original_file = rb_source_map_file_from_id(map, original_file_id);
     if(generated_file != 0 && original_file != 0)
     {
+      U64 generated_col_first = rb_csv_row_optional_u64(row, cols->gen_col_first);
+      U64 generated_col_opl = rb_csv_row_optional_u64(row, cols->gen_col_opl);
+      U64 original_col_first = rb_csv_row_optional_u64(row, cols->orig_col_first);
+      U64 original_col_opl = rb_csv_row_optional_u64(row, cols->orig_col_opl);
       String8 kind = rb_csv_row_field(row, cols->kind);
-      result = rb_source_map_push_entry(arena, map, generated_file->path, generated_first, generated_last, original_file->path, original_first, original_last, kind);
+      result = rb_source_map_push_entry(arena, map, generated_file->path, generated_first, generated_last, generated_col_first, generated_col_opl, original_file->path, original_first, original_last, original_col_first, original_col_opl, kind);
     }
   }
   return result;
@@ -443,9 +478,10 @@ rb_source_map_from_path(Arena *arena, String8 path)
 }
 
 internal RB_SourceMapEntry *
-rb_source_map_entry_from_generated(RB_SourceMap *map, String8 generated_path, U32 line_num)
+rb_source_map_entry_from_generated(RB_SourceMap *map, String8 generated_path, U32 line_num, U32 col_num)
 {
   RB_SourceMapEntry *result = 0;
+  RB_SourceMapEntry *fallback = 0;
   String8 normalized_generated_path = generated_path;
   for EachNode(entry, RB_SourceMapEntry, map->first)
   {
@@ -453,9 +489,44 @@ rb_source_map_entry_from_generated(RB_SourceMap *map, String8 generated_path, U3
        line_num <= entry->generated_line_last &&
        str8_match(entry->generated_path, normalized_generated_path, StringMatchFlag_CaseInsensitive|StringMatchFlag_SlashInsensitive))
     {
-      result = entry;
-      break;
+      if(fallback == 0)
+      {
+        fallback = entry;
+      }
+      B32 entry_has_cols = (entry->generated_col_first != 0 && entry->generated_col_opl != 0);
+      B32 col_matches = (!entry_has_cols || col_num == 0);
+      if(entry_has_cols && col_num != 0)
+      {
+        if(entry->generated_line_first == entry->generated_line_last)
+        {
+          col_matches = (entry->generated_col_first <= col_num && col_num < entry->generated_col_opl);
+        }
+        else if(line_num == entry->generated_line_first)
+        {
+          col_matches = (entry->generated_col_first <= col_num);
+        }
+        else if(line_num == entry->generated_line_last)
+        {
+          col_matches = (col_num < entry->generated_col_opl);
+        }
+        else
+        {
+          col_matches = 1;
+        }
+      }
+      if(col_matches)
+      {
+        result = entry;
+        if(entry_has_cols && col_num != 0)
+        {
+          break;
+        }
+      }
     }
+  }
+  if(result == 0)
+  {
+    result = fallback;
   }
   return result;
 }
@@ -472,6 +543,27 @@ rb_source_map_original_line_from_entry(RB_SourceMapEntry *entry, U32 generated_l
   return result;
 }
 
+internal U32
+rb_source_map_original_col_from_entry(RB_SourceMapEntry *entry, U32 generated_line, U32 generated_col)
+{
+  U32 result = generated_col;
+  if(entry->original_col_first != 0)
+  {
+    result = entry->original_col_first;
+    if(entry->generated_col_first != 0 &&
+       entry->generated_col_opl != 0 &&
+       generated_col != 0 &&
+       entry->generated_line_first == entry->generated_line_last &&
+       entry->original_line_first == entry->original_line_last &&
+       entry->original_col_opl > entry->original_col_first)
+    {
+      U32 generated_delta = (generated_col > entry->generated_col_first) ? generated_col - entry->generated_col_first : 0;
+      result = ClampTop(entry->original_col_first + generated_delta, entry->original_col_opl - 1);
+    }
+  }
+  return result;
+}
+
 internal B32
 rb_source_map_kind_is_opaque(String8 kind)
 {
@@ -481,14 +573,44 @@ rb_source_map_kind_is_opaque(String8 kind)
 }
 
 internal B32
-rb_source_map_original_line_has_opaque_entry(RB_SourceMap *map, RB_SourceMapEntry *entry, U32 original_line)
+rb_source_map_entry_contains_original_loc(RB_SourceMapEntry *entry, U32 original_line, U32 original_col)
+{
+  B32 result = 0;
+  if(entry->original_line_first <= original_line && original_line <= entry->original_line_last)
+  {
+    B32 entry_has_cols = (entry->original_col_first != 0 && entry->original_col_opl != 0);
+    result = (!entry_has_cols || original_col == 0);
+    if(entry_has_cols && original_col != 0)
+    {
+      if(entry->original_line_first == entry->original_line_last)
+      {
+        result = (entry->original_col_first <= original_col && original_col < entry->original_col_opl);
+      }
+      else if(original_line == entry->original_line_first)
+      {
+        result = (entry->original_col_first <= original_col);
+      }
+      else if(original_line == entry->original_line_last)
+      {
+        result = (original_col < entry->original_col_opl);
+      }
+      else
+      {
+        result = 1;
+      }
+    }
+  }
+  return result;
+}
+
+internal B32
+rb_source_map_original_line_has_opaque_entry(RB_SourceMap *map, RB_SourceMapEntry *entry, U32 original_line, U32 original_col)
 {
   B32 result = 0;
   for EachNode(test, RB_SourceMapEntry, map->first)
   {
     if(rb_source_map_kind_is_opaque(test->kind) &&
-       test->original_line_first <= original_line &&
-       original_line <= test->original_line_last &&
+       rb_source_map_entry_contains_original_loc(test, original_line, original_col) &&
        str8_match(test->original_path, entry->original_path, StringMatchFlag_CaseInsensitive|StringMatchFlag_SlashInsensitive))
     {
       result = 1;
@@ -499,12 +621,12 @@ rb_source_map_original_line_has_opaque_entry(RB_SourceMap *map, RB_SourceMapEntr
 }
 
 internal String8
-rb_source_map_policy_kind_from_entry(RB_SourceMap *map, RB_SourceMapEntry *entry, U32 original_line)
+rb_source_map_policy_kind_from_entry(RB_SourceMap *map, RB_SourceMapEntry *entry, U32 original_line, U32 original_col)
 {
   String8 result = entry->kind;
   if((str8_matchi(result, str8_lit("direct")) ||
       str8_matchi(result, str8_lit("plain"))) &&
-     rb_source_map_original_line_has_opaque_entry(map, entry, original_line))
+     rb_source_map_original_line_has_opaque_entry(map, entry, original_line, original_col))
   {
     result = str8_lit("callsite");
   }
@@ -612,7 +734,8 @@ rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_Sou
         for(U64 run_first = 0; run_first < old_seq->line_count;)
         {
           U32 first_line_num = old_seq->line_nums[run_first];
-          RB_SourceMapEntry *first_entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, first_line_num);
+          U32 first_col_num = old_seq->col_nums ? old_seq->col_nums[run_first*2 + 0] : 0;
+          RB_SourceMapEntry *first_entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, first_line_num, first_col_num);
           RDIM_SrcFile *run_src_file = old_seq->src_file;
           if(first_entry != 0)
           {
@@ -623,7 +746,8 @@ rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_Sou
           for(; run_opl < old_seq->line_count; run_opl += 1)
           {
             U32 line_num = old_seq->line_nums[run_opl];
-            RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num);
+            U32 col_num = old_seq->col_nums ? old_seq->col_nums[run_opl*2 + 0] : 0;
+            RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num, col_num);
             RDIM_SrcFile *src_file = old_seq->src_file;
             if(entry != 0)
             {
@@ -652,14 +776,16 @@ rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_Sou
           {
             U64 old_idx = run_first + idx;
             U32 line_num = old_seq->line_nums[old_idx];
-            RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num);
+            U32 col_num = old_seq->col_nums ? old_seq->col_nums[old_idx*2 + 0] : 0;
+            RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num, col_num);
             if(entry != 0)
             {
               U32 original_line = rb_source_map_original_line_from_entry(entry, line_num);
+              U32 original_col = rb_source_map_original_col_from_entry(entry, line_num, col_num);
               line_nums[idx] = original_line;
               if(policies != 0)
               {
-                String8 policy_kind = rb_source_map_policy_kind_from_entry(map, entry, original_line);
+                String8 policy_kind = rb_source_map_policy_kind_from_entry(map, entry, original_line, original_col);
                 rb_source_policy_list_push(arena, policies, old_seq->voffs[old_idx], old_seq->voffs[old_idx+1], policy_kind);
               }
               remapped_line_count += 1;
@@ -670,8 +796,17 @@ rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_Sou
             }
             if(col_nums != 0)
             {
-              col_nums[idx*2 + 0] = old_seq->col_nums[old_idx*2 + 0];
-              col_nums[idx*2 + 1] = old_seq->col_nums[old_idx*2 + 1];
+              if(entry != 0 && entry->original_col_first != 0)
+              {
+                U32 mapped_col = rb_source_map_original_col_from_entry(entry, line_num, col_num);
+                col_nums[idx*2 + 0] = (mapped_col <= max_U16) ? (U16)mapped_col : 0;
+                col_nums[idx*2 + 1] = (entry->original_col_opl <= max_U16) ? (U16)entry->original_col_opl : 0;
+              }
+              else
+              {
+                col_nums[idx*2 + 0] = old_seq->col_nums[old_idx*2 + 0];
+                col_nums[idx*2 + 1] = old_seq->col_nums[old_idx*2 + 1];
+              }
             }
           }
           
