@@ -823,12 +823,15 @@ di_async_tick(void)
           File file = file_open(AccessFlag_ShareRead|AccessFlag_Read, rdi_path);
           FileProperties props = properties_from_file(file);
           U64 source_map_timestamp = 0;
+          U64 source_policy_timestamp = max_U64;
           if(!og_is_rdi && di_shared->source_map_path.size != 0)
           {
             source_map_timestamp = properties_from_file_path(di_shared->source_map_path).modified;
+            String8 source_policy_path = path_replace_file_extension(scratch.arena, rdi_path, str8_lit("srcpolicy"));
+            source_policy_timestamp = properties_from_file_path(source_policy_path).modified;
           }
           U64 min_rdi_timestamp = Max(og_min_timestamp, source_map_timestamp);
-          if(props.modified < min_rdi_timestamp)
+          if(props.modified < min_rdi_timestamp || source_policy_timestamp < min_rdi_timestamp)
           {
             t->rdi_is_stale = 1;
           }

@@ -19,6 +19,7 @@ struct RB_SourceMapEntry
   String8 original_path;
   U32 original_line_first;
   U32 original_line_last;
+  String8 kind;
 };
 
 typedef struct RB_SourceMapFile RB_SourceMapFile;
@@ -43,8 +44,7 @@ struct RB_SourceMap
 typedef struct RB_CSVRow RB_CSVRow;
 struct RB_CSVRow
 {
-  String8 *fields;
-  U64 count;
+  String8Array fields;
 };
 
 typedef struct RB_SourceMapCSVColumns RB_SourceMapCSVColumns;
@@ -59,6 +59,24 @@ struct RB_SourceMapCSVColumns
   U64 orig_file;
   U64 orig_first;
   U64 orig_last;
+  U64 kind;
+};
+
+typedef struct RB_SourcePolicyNode RB_SourcePolicyNode;
+struct RB_SourcePolicyNode
+{
+  RB_SourcePolicyNode *next;
+  U64 voff_first;
+  U64 voff_opl;
+  String8 kind;
+};
+
+typedef struct RB_SourcePolicyList RB_SourcePolicyList;
+struct RB_SourcePolicyList
+{
+  RB_SourcePolicyNode *first;
+  RB_SourcePolicyNode *last;
+  U64 count;
 };
 
 internal String8 rb_source_map_resolved_path(Arena *arena, String8 map_dir, String8 path);
@@ -67,9 +85,9 @@ internal String8
 rb_csv_row_field(RB_CSVRow *row, U64 idx)
 {
   String8 result = {0};
-  if(idx < row->count)
+  if(idx < row->fields.count)
   {
-    result = row->fields[idx];
+    result = row->fields.v[idx];
   }
   return result;
 }
@@ -90,15 +108,10 @@ internal RB_CSVRow
 rb_csv_row_from_line(Arena *arena, String8 line)
 {
   RB_CSVRow result = {0};
-  result.fields = push_array(arena, String8, 128);
+  String8List fields = {0};
   U64 pos = 0;
   for(;;)
   {
-    if(result.count >= 128)
-    {
-      break;
-    }
-    
     String8 field = {0};
     if(pos < line.size && line.str[pos] == '"')
     {
@@ -144,8 +157,7 @@ rb_csv_row_from_line(Arena *arena, String8 line)
       field = str8_skip_chop_whitespace(str8_substr(line, r1u64(field_start, pos)));
     }
     
-    result.fields[result.count] = field;
-    result.count += 1;
+    str8_list_push(arena, &fields, field);
     
     if(pos < line.size && line.str[pos] == ',')
     {
@@ -157,6 +169,7 @@ rb_csv_row_from_line(Arena *arena, String8 line)
     }
     break;
   }
+  result.fields = str8_array_from_list(arena, &fields);
   return result;
 }
 
@@ -164,9 +177,9 @@ internal U64
 rb_csv_row_column_idx(RB_CSVRow *row, String8 name)
 {
   U64 result = max_U64;
-  for(U64 idx = 0; idx < row->count; idx += 1)
+  for(U64 idx = 0; idx < row->fields.count; idx += 1)
   {
-    if(str8_match(row->fields[idx], name, StringMatchFlag_CaseInsensitive))
+    if(str8_matchi(row->fields.v[idx], name))
     {
       result = idx;
       break;
@@ -189,6 +202,7 @@ rb_source_map_csv_columns_from_header(RB_CSVRow *header)
   result.orig_file  = rb_csv_row_column_idx(header, str8_lit("orig_file"));
   result.orig_first = rb_csv_row_column_idx(header, str8_lit("orig_first"));
   result.orig_last  = rb_csv_row_column_idx(header, str8_lit("orig_last"));
+  result.kind       = rb_csv_row_column_idx(header, str8_lit("kind"));
   return result;
 }
 
@@ -203,7 +217,8 @@ rb_source_map_csv_columns_are_valid(RB_SourceMapCSVColumns *cols)
                 cols->gen_last   != max_U64 &&
                 cols->orig_file  != max_U64 &&
                 cols->orig_first != max_U64 &&
-                cols->orig_last  != max_U64);
+                cols->orig_last  != max_U64 &&
+                cols->kind       != max_U64);
   return result;
 }
 
@@ -211,7 +226,7 @@ internal RB_SourceMapFile *
 rb_source_map_file_from_id(RB_SourceMap *map, U64 id)
 {
   RB_SourceMapFile *result = 0;
-  for(RB_SourceMapFile *file = map->first_file; file != 0; file = file->next)
+  for EachNode(file, RB_SourceMapFile, map->first_file)
   {
     if(file->id == id)
     {
@@ -233,7 +248,7 @@ rb_source_map_push_file(Arena *arena, RB_SourceMap *map, U32 id, String8 path)
 }
 
 internal B32
-rb_source_map_push_entry(Arena *arena, RB_SourceMap *map, String8 generated_path, U64 generated_first, U64 generated_last, String8 original_path, U64 original_first, U64 original_last)
+rb_source_map_push_entry(Arena *arena, RB_SourceMap *map, String8 generated_path, U64 generated_first, U64 generated_last, String8 original_path, U64 original_first, U64 original_last, String8 kind)
 {
   B32 result = 0;
   if(generated_first <= generated_last &&
@@ -250,6 +265,7 @@ rb_source_map_push_entry(Arena *arena, RB_SourceMap *map, String8 generated_path
     entry->original_path = original_path;
     entry->original_line_first = (U32)original_first;
     entry->original_line_last = (U32)original_last;
+    entry->kind = kind;
     SLLQueuePush(map->first, map->last, entry);
     map->count += 1;
     result = 1;
@@ -292,10 +308,58 @@ rb_source_map_parse_map_row(Arena *arena, RB_SourceMap *map, RB_SourceMapCSVColu
     RB_SourceMapFile *original_file = rb_source_map_file_from_id(map, original_file_id);
     if(generated_file != 0 && original_file != 0)
     {
-      result = rb_source_map_push_entry(arena, map, generated_file->path, generated_first, generated_last, original_file->path, original_first, original_last);
+      String8 kind = rb_csv_row_field(row, cols->kind);
+      result = rb_source_map_push_entry(arena, map, generated_file->path, generated_first, generated_last, original_file->path, original_first, original_last, kind);
     }
   }
   return result;
+}
+
+internal void
+rb_source_policy_list_push(Arena *arena, RB_SourcePolicyList *list, U64 voff_first, U64 voff_opl, String8 kind)
+{
+  if(voff_first < voff_opl && kind.size != 0)
+  {
+    if(list->last != 0 &&
+       list->last->voff_opl == voff_first &&
+       str8_matchi(list->last->kind, kind))
+    {
+      list->last->voff_opl = voff_opl;
+    }
+    else
+    {
+      RB_SourcePolicyNode *node = push_array(arena, RB_SourcePolicyNode, 1);
+      node->voff_first = voff_first;
+      node->voff_opl = voff_opl;
+      node->kind = kind;
+      SLLQueuePush(list->first, list->last, node);
+      list->count += 1;
+    }
+  }
+}
+
+internal void
+rb_source_policy_write_csv(Arena *arena, String8 output_path, RB_SourcePolicyList *list)
+{
+  if(output_path.size != 0)
+  {
+    String8 policy_path = path_replace_file_extension(arena, output_path, str8_lit("srcpolicy"));
+    String8List data = {0};
+    str8_list_push(arena, &data, str8_lit("record,voff_first,voff_opl,kind\n"));
+    str8_list_push(arena, &data, str8_lit("version,1,,\n"));
+    for EachNode(node, RB_SourcePolicyNode, list->first)
+    {
+      str8_list_pushf(arena, &data, "policy,%I64u,%I64u,%S\n", node->voff_first, node->voff_opl, node->kind);
+    }
+    if(write_data_list_to_file_path(policy_path, data))
+    {
+      log_infof("Source policy written to %S", policy_path);
+    }
+    else
+    {
+      log_user_errorf("ERROR: failed to write source policy file %S\n", policy_path);
+    }
+  }
 }
 
 internal String8
@@ -327,13 +391,13 @@ rb_source_map_from_path(Arena *arena, String8 path)
       String8 raw_line = str8_chop_line(&remaining);
       String8 line = str8_skip_chop_whitespace(raw_line);
       line_num += 1;
-      if(line.size == 0 || str8_match(str8_prefix(line, 1), str8_lit("#"), 0))
+      if(line.size == 0 || line.str[0] == '#')
       {
         continue;
       }
       
       RB_CSVRow row = rb_csv_row_from_line(arena, line);
-      if(row.count == 0)
+      if(row.fields.count == 0)
       {
         continue;
       }
@@ -351,18 +415,18 @@ rb_source_map_from_path(Arena *arena, String8 path)
       }
       
       String8 record = rb_csv_row_field(&row, cols.record);
-      if(str8_match(record, str8_lit("version"), StringMatchFlag_CaseInsensitive))
+      if(str8_matchi(record, str8_lit("version")))
       {
         continue;
       }
-      else if(str8_match(record, str8_lit("file"), StringMatchFlag_CaseInsensitive))
+      else if(str8_matchi(record, str8_lit("file")))
       {
         if(!rb_source_map_parse_file_row(arena, &result, map_dir, &cols, &row))
         {
           log_user_errorf("Could not parse source map `%S` line %I64u. Invalid file row.", full_path, line_num);
         }
       }
-      else if(str8_match(record, str8_lit("map"), StringMatchFlag_CaseInsensitive))
+      else if(str8_matchi(record, str8_lit("map")))
       {
         if(!rb_source_map_parse_map_row(arena, &result, &cols, &row))
         {
@@ -383,7 +447,7 @@ rb_source_map_entry_from_generated(RB_SourceMap *map, String8 generated_path, U3
 {
   RB_SourceMapEntry *result = 0;
   String8 normalized_generated_path = generated_path;
-  for(RB_SourceMapEntry *entry = map->first; entry != 0; entry = entry->next)
+  for EachNode(entry, RB_SourceMapEntry, map->first)
   {
     if(entry->generated_line_first <= line_num &&
        line_num <= entry->generated_line_last &&
@@ -404,6 +468,45 @@ rb_source_map_original_line_from_entry(RB_SourceMapEntry *entry, U32 generated_l
   {
     U32 generated_delta = generated_line - entry->generated_line_first;
     result = ClampTop(entry->original_line_first + generated_delta, entry->original_line_last);
+  }
+  return result;
+}
+
+internal B32
+rb_source_map_kind_is_opaque(String8 kind)
+{
+  B32 result = (str8_matchi(kind, str8_lit("callsite")) ||
+                str8_matchi(kind, str8_lit("generated")));
+  return result;
+}
+
+internal B32
+rb_source_map_original_line_has_opaque_entry(RB_SourceMap *map, RB_SourceMapEntry *entry, U32 original_line)
+{
+  B32 result = 0;
+  for EachNode(test, RB_SourceMapEntry, map->first)
+  {
+    if(rb_source_map_kind_is_opaque(test->kind) &&
+       test->original_line_first <= original_line &&
+       original_line <= test->original_line_last &&
+       str8_match(test->original_path, entry->original_path, StringMatchFlag_CaseInsensitive|StringMatchFlag_SlashInsensitive))
+    {
+      result = 1;
+      break;
+    }
+  }
+  return result;
+}
+
+internal String8
+rb_source_map_policy_kind_from_entry(RB_SourceMap *map, RB_SourceMapEntry *entry, U32 original_line)
+{
+  String8 result = entry->kind;
+  if((str8_matchi(result, str8_lit("direct")) ||
+      str8_matchi(result, str8_lit("plain"))) &&
+     rb_source_map_original_line_has_opaque_entry(map, entry, original_line))
+  {
+    result = str8_lit("callsite");
   }
   return result;
 }
@@ -478,7 +581,7 @@ rb_source_map_rebuild_src_file_line_maps(Arena *arena, RDIM_BakeParams *params)
 }
 
 internal void
-rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_SourceMap *map)
+rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_SourceMap *map, RB_SourcePolicyList *policies)
 {
   if(map->count == 0)
   {
@@ -552,7 +655,13 @@ rb_apply_source_map_to_bake_params(Arena *arena, RDIM_BakeParams *params, RB_Sou
             RB_SourceMapEntry *entry = rb_source_map_entry_from_generated(map, old_seq->src_file->path, line_num);
             if(entry != 0)
             {
-              line_nums[idx] = rb_source_map_original_line_from_entry(entry, line_num);
+              U32 original_line = rb_source_map_original_line_from_entry(entry, line_num);
+              line_nums[idx] = original_line;
+              if(policies != 0)
+              {
+                String8 policy_kind = rb_source_map_policy_kind_from_entry(map, entry, original_line);
+                rb_source_policy_list_push(arena, policies, old_seq->voffs[old_idx], old_seq->voffs[old_idx+1], policy_kind);
+              }
               remapped_line_count += 1;
             }
             else
@@ -1072,6 +1181,7 @@ rb_thread_entry_point(void *p)
   {
     source_map_path = cmd_line_string(cmdline, str8_lit("source-provenance"));
   }
+  RB_SourcePolicyList source_policies = {0};
   {
     //- rjf: user manually specified output kind
     if(output_kind == OutputKind_Null)
@@ -1514,7 +1624,7 @@ rb_thread_entry_point(void *p)
       {
         source_map = push_array(arena, RB_SourceMap, 1);
         *source_map = rb_source_map_from_path(arena, source_map_path);
-        rb_apply_source_map_to_bake_params(arena, bake_params, source_map);
+        rb_apply_source_map_to_bake_params(arena, bake_params, source_map, &source_policies);
       }
       lane_sync();
       
@@ -2166,6 +2276,10 @@ rb_thread_entry_point(void *p)
       if(is_written)
       {
         log_infof("Results written to %S", output_path);
+        if(output_kind == OutputKind_RDI && source_map_path.size != 0)
+        {
+          rb_source_policy_write_csv(arena, output_path, &source_policies);
+        }
       }
       else
       {

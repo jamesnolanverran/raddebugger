@@ -50,6 +50,289 @@ d_breakpoint_array_copy(Arena *arena, D_BreakpointArray *src)
 }
 
 ////////////////////////////////
+//~ Source Map Stepping Helpers
+
+typedef struct D_SourceMapCSVRow D_SourceMapCSVRow;
+struct D_SourceMapCSVRow
+{
+  String8Array fields;
+};
+
+typedef struct D_SourcePolicyCSVColumns D_SourcePolicyCSVColumns;
+struct D_SourcePolicyCSVColumns
+{
+  U64 record;
+  U64 voff_first;
+  U64 voff_opl;
+  U64 kind;
+};
+
+typedef struct D_SourcePolicyNode D_SourcePolicyNode;
+struct D_SourcePolicyNode
+{
+  D_SourcePolicyNode *next;
+  U64 voff_first;
+  U64 voff_opl;
+  String8 kind;
+};
+
+typedef struct D_SourcePolicyList D_SourcePolicyList;
+struct D_SourcePolicyList
+{
+  D_SourcePolicyNode *first;
+  D_SourcePolicyNode *last;
+  U64 count;
+};
+
+internal String8
+d_source_map_csv_row_field(D_SourceMapCSVRow *row, U64 idx)
+{
+  String8 result = {0};
+  if(idx < row->fields.count)
+  {
+    result = row->fields.v[idx];
+  }
+  return result;
+}
+
+internal B32
+d_source_map_csv_row_u64(D_SourceMapCSVRow *row, U64 idx, U64 *out)
+{
+  B32 result = 0;
+  String8 field = d_source_map_csv_row_field(row, idx);
+  if(field.size != 0)
+  {
+    result = try_u64_from_str8_c_rules(field, out);
+  }
+  return result;
+}
+
+internal D_SourceMapCSVRow
+d_source_map_csv_row_from_line(Arena *arena, String8 line)
+{
+  D_SourceMapCSVRow result = {0};
+  String8List fields = {0};
+  U64 pos = 0;
+  for(;;)
+  {
+    String8 field = {0};
+    if(pos < line.size && line.str[pos] == '"')
+    {
+      pos += 1;
+      U64 field_start = pos;
+      B32 closed_quote = 0;
+      String8List parts = {0};
+      for(; pos < line.size;)
+      {
+        if(line.str[pos] == '"')
+        {
+          if(pos+1 < line.size && line.str[pos+1] == '"')
+          {
+            str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+            str8_list_push(arena, &parts, str8_lit("\""));
+            pos += 2;
+            field_start = pos;
+          }
+          else
+          {
+            str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+            pos += 1;
+            closed_quote = 1;
+            break;
+          }
+        }
+        else
+        {
+          pos += 1;
+        }
+      }
+      if(!closed_quote && field_start < line.size && pos >= line.size)
+      {
+        str8_list_push(arena, &parts, str8_substr(line, r1u64(field_start, pos)));
+      }
+      field = str8_list_join(arena, &parts, 0);
+      for(; pos < line.size && char_is_space(line.str[pos]); pos += 1);
+    }
+    else
+    {
+      U64 field_start = pos;
+      for(; pos < line.size && line.str[pos] != ','; pos += 1);
+      field = str8_skip_chop_whitespace(str8_substr(line, r1u64(field_start, pos)));
+    }
+
+    str8_list_push(arena, &fields, field);
+
+    if(pos < line.size && line.str[pos] == ',')
+    {
+      pos += 1;
+      if(pos <= line.size)
+      {
+        continue;
+      }
+    }
+    break;
+  }
+  result.fields = str8_array_from_list(arena, &fields);
+  return result;
+}
+
+internal U64
+d_source_map_csv_row_column_idx(D_SourceMapCSVRow *row, String8 name)
+{
+  U64 result = max_U64;
+  for(U64 idx = 0; idx < row->fields.count; idx += 1)
+  {
+    if(str8_matchi(row->fields.v[idx], name))
+    {
+      result = idx;
+      break;
+    }
+  }
+  return result;
+}
+
+internal D_SourcePolicyCSVColumns
+d_source_policy_csv_columns_from_header(D_SourceMapCSVRow *header)
+{
+  D_SourcePolicyCSVColumns result = {0};
+  MemorySet(&result, 0xff, sizeof(result));
+  result.record     = d_source_map_csv_row_column_idx(header, str8_lit("record"));
+  result.voff_first = d_source_map_csv_row_column_idx(header, str8_lit("voff_first"));
+  result.voff_opl   = d_source_map_csv_row_column_idx(header, str8_lit("voff_opl"));
+  result.kind       = d_source_map_csv_row_column_idx(header, str8_lit("kind"));
+  return result;
+}
+
+internal B32
+d_source_policy_csv_columns_are_valid(D_SourcePolicyCSVColumns *cols)
+{
+  B32 result = (cols->record     != max_U64 &&
+                cols->voff_first != max_U64 &&
+                cols->voff_opl   != max_U64 &&
+                cols->kind       != max_U64);
+  return result;
+}
+
+internal void
+d_source_policy_list_push(Arena *arena, D_SourcePolicyList *list, U64 voff_first, U64 voff_opl, String8 kind)
+{
+  if(voff_first < voff_opl && kind.size != 0)
+  {
+    D_SourcePolicyNode *node = push_array(arena, D_SourcePolicyNode, 1);
+    node->voff_first = voff_first;
+    node->voff_opl = voff_opl;
+    node->kind = kind;
+    SLLQueuePush(list->first, list->last, node);
+    list->count += 1;
+  }
+}
+
+internal B32
+d_source_map_kind_is_opaque(String8 kind)
+{
+  B32 result = (str8_matchi(kind, str8_lit("callsite")) ||
+                str8_matchi(kind, str8_lit("generated")));
+  return result;
+}
+
+internal String8
+d_source_policy_path_from_module(Arena *arena, D_Entity *module)
+{
+  String8 result = {0};
+  String8List candidates = {0};
+  if(module != &d_entity_nil)
+  {
+    D_Entity *debug_info_path_entity = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
+    if(debug_info_path_entity != &d_entity_nil && debug_info_path_entity->string.size != 0)
+    {
+      str8_list_push(arena, &candidates, path_replace_file_extension(arena, debug_info_path_entity->string, str8_lit("srcpolicy")));
+      str8_list_pushf(arena, &candidates, "%S.source_map.srcpolicy", str8_chop_last_dot(debug_info_path_entity->string));
+    }
+  }
+  if(di_shared != 0 && di_shared->source_map_path.size != 0)
+  {
+    str8_list_push(arena, &candidates, path_replace_file_extension(arena, di_shared->source_map_path, str8_lit("source_map.srcpolicy")));
+    str8_list_push(arena, &candidates, path_replace_file_extension(arena, di_shared->source_map_path, str8_lit("srcpolicy")));
+  }
+  for EachNode(n, String8Node, candidates.first)
+  {
+    if(properties_from_file_path(n->string).modified != 0)
+    {
+      result = n->string;
+      break;
+    }
+  }
+  if(result.size == 0 && candidates.first != 0)
+  {
+    result = candidates.first->string;
+  }
+  return result;
+}
+
+internal D_SourcePolicyList
+d_source_policy_list_from_path(Arena *arena, String8 policy_path)
+{
+  D_SourcePolicyList result = {0};
+  if(policy_path.size != 0)
+  {
+    String8 data = data_from_file_path(arena, policy_path);
+    if(data.size != 0)
+    {
+      D_SourcePolicyCSVColumns cols = {0};
+      B32 have_header = 0;
+      for(String8 remaining = data; remaining.size != 0;)
+      {
+        String8 raw_line = str8_chop_line(&remaining);
+        String8 line = str8_skip_chop_whitespace(raw_line);
+        if(line.size == 0 || line.str[0] == '#')
+        {
+          continue;
+        }
+        D_SourceMapCSVRow row = d_source_map_csv_row_from_line(arena, line);
+        if(!have_header)
+        {
+          cols = d_source_policy_csv_columns_from_header(&row);
+          have_header = d_source_policy_csv_columns_are_valid(&cols);
+          if(!have_header)
+          {
+            break;
+          }
+          continue;
+        }
+        String8 record = d_source_map_csv_row_field(&row, cols.record);
+        if(str8_matchi(record, str8_lit("policy")))
+        {
+          U64 voff_first = 0;
+          U64 voff_opl = 0;
+          if(d_source_map_csv_row_u64(&row, cols.voff_first, &voff_first) &&
+             d_source_map_csv_row_u64(&row, cols.voff_opl, &voff_opl))
+          {
+            String8 kind = d_source_map_csv_row_field(&row, cols.kind);
+            d_source_policy_list_push(arena, &result, voff_first, voff_opl, kind);
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+internal B32
+d_source_policy_list_voff_is_opaque(D_SourcePolicyList *list, U64 voff)
+{
+  B32 result = 0;
+  for EachNode(node, D_SourcePolicyNode, list->first)
+  {
+    if(node->voff_first <= voff && voff < node->voff_opl)
+    {
+      result = d_source_map_kind_is_opaque(node->kind);
+      break;
+    }
+  }
+  return result;
+}
+
+////////////////////////////////
 //~ rjf: Path Map Application
 
 internal String8List
@@ -368,7 +651,6 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread)
     log_infof("voff_range: {0x%I64x, 0x%I64x}\n", line_voff_rng.min, line_voff_rng.max);
     log_infof("vaddr_range: {0x%I64x, 0x%I64x}\n", line_vaddr_rng.min, line_vaddr_rng.max);
   }
-  
   // rjf: gather other ranges on this same textual line, which we don't want to return to
   Rng1U64List all_vaddr_ranges_on_same_line = {0};
   {
@@ -604,7 +886,6 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
     log_infof("voff_range: {0x%I64x, 0x%I64x}\n", line_voff_rng.min, line_voff_rng.max);
     log_infof("vaddr_range: {0x%I64x, 0x%I64x}\n", line_vaddr_rng.min, line_vaddr_rng.max);
   }
-  
   // rjf: gather other ranges on this same textual line, which we don't want to return to
   Rng1U64List all_vaddr_ranges_on_same_line = {0};
   {
@@ -659,6 +940,13 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
                                                               machine_code);
   }
   
+  // rjf: source provenance policy for this module, keyed by voff ranges
+  D_SourcePolicyList source_policy = {0};
+  {
+    String8 source_policy_path = d_source_policy_path_from_module(scratch.arena, module);
+    source_policy = d_source_policy_list_from_path(scratch.arena, source_policy_path);
+  }
+
   // rjf: determine last 
   DASM_CtrlFlowPoint *last_call_point = 0;
   if(good_machine_code) for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
@@ -676,6 +964,12 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
     D_TrapFlags flags = 0;
     B32 add = 1;
     U64 trap_addr = point->vaddr;
+    B32 call_is_opaque = ((point->inst_flags & DASM_InstFlag_Call) &&
+                          d_source_policy_list_voff_is_opaque(&source_policy, d_voff_from_vaddr(module, point->vaddr)));
+    if(call_is_opaque)
+    {
+      add = 0;
+    }
     
     // rjf: if this is not the last call instruction in the control flow,
     // and if we have no line info for this address, then do not add.

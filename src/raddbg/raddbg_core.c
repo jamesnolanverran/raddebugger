@@ -42,8 +42,7 @@ rd_regs_copy(Arena *arena, RD_Regs *src)
 typedef struct RD_SourceNavCSVRow RD_SourceNavCSVRow;
 struct RD_SourceNavCSVRow
 {
-  String8 *fields;
-  U64 count;
+  String8Array fields;
 };
 
 typedef struct RD_SourceNavCSVColumns RD_SourceNavCSVColumns;
@@ -64,8 +63,17 @@ struct RD_SourceNavCSVColumns
 typedef struct RD_SourceNavFile RD_SourceNavFile;
 struct RD_SourceNavFile
 {
+  RD_SourceNavFile *next;
   U64 id;
   String8 path;
+};
+
+typedef struct RD_SourceNavFileList RD_SourceNavFileList;
+struct RD_SourceNavFileList
+{
+  RD_SourceNavFile *first;
+  RD_SourceNavFile *last;
+  U64 count;
 };
 
 typedef struct RD_SourceNavResult RD_SourceNavResult;
@@ -80,9 +88,9 @@ internal String8
 rd_source_nav_csv_row_field(RD_SourceNavCSVRow *row, U64 idx)
 {
   String8 result = {0};
-  if(idx < row->count)
+  if(idx < row->fields.count)
   {
-    result = row->fields[idx];
+    result = row->fields.v[idx];
   }
   return result;
 }
@@ -103,15 +111,10 @@ internal RD_SourceNavCSVRow
 rd_source_nav_csv_row_from_line(Arena *arena, String8 line)
 {
   RD_SourceNavCSVRow result = {0};
-  result.fields = push_array(arena, String8, 64);
+  String8List fields = {0};
   U64 pos = 0;
   for(;;)
   {
-    if(result.count >= 64)
-    {
-      break;
-    }
-    
     String8 field = {0};
     if(pos < line.size && line.str[pos] == '"')
     {
@@ -157,8 +160,7 @@ rd_source_nav_csv_row_from_line(Arena *arena, String8 line)
       field = str8_skip_chop_whitespace(str8_substr(line, r1u64(field_start, pos)));
     }
     
-    result.fields[result.count] = field;
-    result.count += 1;
+    str8_list_push(arena, &fields, field);
     
     if(pos < line.size && line.str[pos] == ',')
     {
@@ -170,6 +172,7 @@ rd_source_nav_csv_row_from_line(Arena *arena, String8 line)
     }
     break;
   }
+  result.fields = str8_array_from_list(arena, &fields);
   return result;
 }
 
@@ -177,9 +180,9 @@ internal U64
 rd_source_nav_csv_row_column_idx(RD_SourceNavCSVRow *row, String8 name)
 {
   U64 result = max_U64;
-  for(U64 idx = 0; idx < row->count; idx += 1)
+  for(U64 idx = 0; idx < row->fields.count; idx += 1)
   {
-    if(str8_match(row->fields[idx], name, StringMatchFlag_CaseInsensitive))
+    if(str8_matchi(row->fields.v[idx], name))
     {
       result = idx;
       break;
@@ -223,18 +226,28 @@ rd_source_nav_csv_columns_are_valid(RD_SourceNavCSVColumns *cols)
 }
 
 internal String8
-rd_source_nav_file_path_from_id(RD_SourceNavFile *files, U64 files_count, U64 id)
+rd_source_nav_file_path_from_id(RD_SourceNavFileList *files, U64 id)
 {
   String8 result = {0};
-  for(U64 idx = 0; idx < files_count; idx += 1)
+  for EachNode(file, RD_SourceNavFile, files->first)
   {
-    if(files[idx].id == id)
+    if(file->id == id)
     {
-      result = files[idx].path;
+      result = file->path;
       break;
     }
   }
   return result;
+}
+
+internal void
+rd_source_nav_file_list_push(Arena *arena, RD_SourceNavFileList *files, U64 id, String8 path)
+{
+  RD_SourceNavFile *file = push_array(arena, RD_SourceNavFile, 1);
+  file->id = id;
+  file->path = path;
+  SLLQueuePush(files->first, files->last, file);
+  files->count += 1;
 }
 
 internal B32
@@ -249,15 +262,14 @@ rd_source_nav_lookup(Arena *arena, String8 nav_path, String8 current_file_path, 
     String8 data = data_from_file_path(scratch.arena, full_path);
     if(data.size != 0)
     {
-      RD_SourceNavFile *files = push_array(scratch.arena, RD_SourceNavFile, 4096);
-      U64 files_count = 0;
+      RD_SourceNavFileList files = {0};
       B32 have_header = 0;
       RD_SourceNavCSVColumns cols = {0};
       for(String8 remaining = data; remaining.size != 0 && !result;)
       {
         String8 raw_line = str8_chop_line(&remaining);
         String8 line = str8_skip_chop_whitespace(raw_line);
-        if(line.size == 0 || str8_match(str8_prefix(line, 1), str8_lit("#"), 0))
+        if(line.size == 0 || line.str[0] == '#')
         {
           continue;
         }
@@ -271,18 +283,18 @@ rd_source_nav_lookup(Arena *arena, String8 nav_path, String8 current_file_path, 
         }
         
         String8 record = rd_source_nav_csv_row_field(&row, cols.record);
-        if(str8_match(record, str8_lit("file"), StringMatchFlag_CaseInsensitive))
+        if(str8_matchi(record, str8_lit("file")))
         {
           U64 id = 0;
           String8 path = rd_source_nav_csv_row_field(&row, cols.path);
-          if(files_count < 4096 && rd_source_nav_csv_row_u64(&row, cols.id, &id) && path.size != 0)
+          if(rd_source_nav_csv_row_u64(&row, cols.id, &id) && path.size != 0)
           {
             String8 resolved_path = path_absolute_dst_from_relative_dst_src(scratch.arena, path, nav_dir);
             resolved_path = path_normalized_from_string(scratch.arena, resolved_path);
-            files[files_count++] = (RD_SourceNavFile){id, resolved_path};
+            rd_source_nav_file_list_push(scratch.arena, &files, id, resolved_path);
           }
         }
-        else if(str8_match(record, str8_lit("ref"), StringMatchFlag_CaseInsensitive))
+        else if(str8_matchi(record, str8_lit("ref")))
         {
           String8 row_name = rd_source_nav_csv_row_field(&row, cols.name);
           U64 ref_file_id = 0;
@@ -297,8 +309,8 @@ rd_source_nav_lookup(Arena *arena, String8 nav_path, String8 current_file_path, 
              rd_source_nav_csv_row_u64(&row, cols.def_file, &def_file_id) &&
              rd_source_nav_csv_row_u64(&row, cols.def_first, &def_first))
           {
-            String8 ref_path = rd_source_nav_file_path_from_id(files, files_count, ref_file_id);
-            String8 def_path = rd_source_nav_file_path_from_id(files, files_count, def_file_id);
+            String8 ref_path = rd_source_nav_file_path_from_id(&files, ref_file_id);
+            String8 def_path = rd_source_nav_file_path_from_id(&files, def_file_id);
             B32 line_matches = (current_line_num == 0 || (ref_first <= current_line_num && current_line_num <= ref_last));
             B32 file_matches = (current_file_path.size == 0 || path_match_normalized(ref_path, current_file_path));
             if(line_matches && file_matches && def_path.size != 0)
