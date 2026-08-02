@@ -15555,6 +15555,7 @@ rd_frame(void)
               // rjf: try to resolve name through source navigation metadata
               String8 file_path = {0};
               U64 file_line_num = 0;
+              B32 name_resolved_from_source_nav = 0;
               if(!name_resolved && di_shared->source_nav_path.size != 0)
               {
                 String8 nav_name = name;
@@ -15578,6 +15579,7 @@ rd_frame(void)
                 if(rd_source_nav_lookup(scratch.arena, di_shared->source_nav_path, current_file_path, current_line_num, nav_name, &nav))
                 {
                   name_resolved = 1;
+                  name_resolved_from_source_nav = 1;
                   file_path = nav.file_path;
                   file_line_num = nav.line_num;
                 }
@@ -15690,7 +15692,11 @@ rd_frame(void)
               // rjf: name resolved to a file path
               if(name_resolved && file_path.size != 0)
               {
-                rd_cmd(RD_CmdKind_FindCodeLocation, .file_path = file_path, .line_num = file_line_num, .vaddr = 0);
+                rd_cmd(RD_CmdKind_FindCodeLocation,
+                       .file_path = file_path,
+                       .line_num = file_line_num,
+                       .vaddr = 0,
+                       .prefer_new_tab = name_resolved_from_source_nav);
               }
             }
           }break;
@@ -15847,28 +15853,31 @@ rd_frame(void)
               // rjf: first, try to find panel/view pair that already has the src file open
               info->panel_w_this_src_code = &cfg_nil_panel_node;
               info->view_w_this_src_code = &cfg_nil_node;
-              for(CFG_PanelNode *panel = panel_tree.root;
-                  panel != &cfg_nil_panel_node;
-                  panel = cfg_panel_node_rec__depth_first_pre(panel_tree.root, panel).next)
+              if(!prefer_new_tab)
               {
-                if(panel->first != &cfg_nil_panel_node)
+                for(CFG_PanelNode *panel = panel_tree.root;
+                    panel != &cfg_nil_panel_node;
+                    panel = cfg_panel_node_rec__depth_first_pre(panel_tree.root, panel).next)
                 {
-                  continue;
-                }
-                for(CFG_NodePtrNode *tab_n = panel->tabs.first; tab_n != 0; tab_n = tab_n->next)
-                {
-                  CFG_Node *tab = tab_n->v;
-                  if(rd_cfg_is_project_filtered(tab)) { continue; }
-                  String8 tab_expr = rd_expr_from_cfg(tab);
-                  String8 tab_file_path = rd_file_path_from_eval_string(scratch.arena, tab_expr);
-                  if((str8_match(tab->string, str8_lit("text"), 0) || str8_match(tab->string, str8_lit("pending"), 0)) && 
-                     path_match_normalized(tab_file_path, file_path))
+                  if(panel->first != &cfg_nil_panel_node)
                   {
-                    info->panel_w_this_src_code = panel;
-                    info->view_w_this_src_code = tab;
-                    if(tab == panel->selected_tab)
+                    continue;
+                  }
+                  for(CFG_NodePtrNode *tab_n = panel->tabs.first; tab_n != 0; tab_n = tab_n->next)
+                  {
+                    CFG_Node *tab = tab_n->v;
+                    if(rd_cfg_is_project_filtered(tab)) { continue; }
+                    String8 tab_expr = rd_expr_from_cfg(tab);
+                    String8 tab_file_path = rd_file_path_from_eval_string(scratch.arena, tab_expr);
+                    if((str8_match(tab->string, str8_lit("text"), 0) || str8_match(tab->string, str8_lit("pending"), 0)) &&
+                       path_match_normalized(tab_file_path, file_path))
                     {
-                      break;
+                      info->panel_w_this_src_code = panel;
+                      info->view_w_this_src_code = tab;
+                      if(tab == panel->selected_tab)
+                      {
+                        break;
+                      }
                     }
                   }
                 }
