@@ -9,7 +9,7 @@ and macro reference-to-definition navigation.
 
 See:
 
-- https://github.com/jamesnolanverran/native-source-maps
+- https://github.com/jamesnolanverran/native_source_maps
 
 The upstream RAD Debugger project is here:
 
