@@ -9,7 +9,6 @@ and macro reference-to-definition navigation.
 
 See:
 
-- https://github.com/jamesnolanverran/mverse_demo
 - https://github.com/jamesnolanverran/native-source-maps
 
 The upstream RAD Debugger project is here:
