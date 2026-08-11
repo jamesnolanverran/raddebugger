@@ -7,6 +7,15 @@ It is currently used with the Mverse demo to explore debugger behavior for
 generated source: authored-source views, breakpoints, column-aware stepping,
 and macro reference-to-definition navigation.
 
+Example launch command:
+
+```bat
+raddbg.exe --source-map:basics.srcmap basics.exe
+```
+
+Pass `--source-map` before the target executable. If a matching `.srcnav` file
+is next to the `.srcmap`, this fork will load it automatically.
+
 See:
 
 - https://github.com/jamesnolanverran/native_source_maps
