@@ -1,3 +1,23 @@
+# RAD Debugger Source Map Fork
+
+This fork contains experimental source-map support for generated C/C++
+workflows.
+
+It is currently used with the Mverse demo to explore debugger behavior for
+generated source: authored-source views, breakpoints, column-aware stepping,
+and macro reference-to-definition navigation.
+
+See:
+
+- https://github.com/jamesnolanverran/mverse_demo
+- https://github.com/jamesnolanverran/native-source-maps
+
+The upstream RAD Debugger project is here:
+
+- https://github.com/EpicGames/raddebugger
+
+---
+
 # The RAD Debugger Project
 
 _**NOTE:** This README does not document usage instructions and tips for the
